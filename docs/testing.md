@@ -122,6 +122,11 @@ Linux CI and release preflight run this gate explicitly; ordinary unit tests
 mark it ignored, and macOS preflight reports it as unrun. This host test does
 not replace the Firecracker and Lima VM integration gates.
 
+The filesystem-backed non-UTF-8 workspace test runs on Linux; macOS APFS
+rejects the fixture filename. The Lima resize spawn-failure test runs in an
+isolated child process with an empty executable search directory, so it cannot
+find a host `truncate` or change another test's environment.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real

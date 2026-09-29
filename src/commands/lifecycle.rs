@@ -2557,6 +2557,7 @@ fn bytes_to_gib(bytes: u64) -> u32 {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
+    #[cfg(not(target_os = "macos"))]
     use crate::backend::VmBackend as _;
 
     #[cfg(target_os = "linux")]
@@ -3264,7 +3265,7 @@ mod tests {
     /// reach `provision_first_boot` as `display()`'s U+FFFD substitution,
     /// naming a directory that does not exist — and fail there identically on
     /// every re-run, so the "re-run to finish" advice would never finish.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn check_reprovision_workspace_source_rejects_a_non_utf8_workspace_dir() {
         use std::os::unix::ffi::OsStrExt as _;
