@@ -17,6 +17,7 @@ pub mod github_repo;
 mod github_submodules;
 mod guest;
 mod guest_env_state;
+pub mod guest_files;
 mod model_state;
 mod naming;
 mod pat_prompt;
