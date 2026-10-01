@@ -26,6 +26,9 @@ mod naming;
 mod pat_prompt;
 mod paths;
 mod port_forward;
+mod private_storage;
+#[cfg(target_os = "linux")]
+mod privileged_disk;
 mod proxy;
 mod proxy_state;
 mod remote_command;
@@ -65,7 +68,7 @@ mod workspace;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::engine::ArgValueCandidates;
 
@@ -101,6 +104,15 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal descriptor-bound operations on Firecracker disk images.
+    #[cfg(target_os = "linux")]
+    #[command(name = "__disk-op", hide = true)]
+    DiskOp {
+        operation: String,
+        root: PathBuf,
+        path: PathBuf,
+        argument: Option<String>,
+    },
     /// Internal privileged helper for a mounted Firecracker rootfs.
     #[cfg(target_os = "linux")]
     #[command(name = "__patch-guest-network", hide = true)]
@@ -292,7 +304,10 @@ enum Commands {
     /// Restart a stopped VM
     Start {
         /// Stopped instance name (optional only when exactly one stopped instance exists)
-        #[arg(value_parser = config::InstanceName::new)]
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::stopped_instance_candidates),
+        )]
         name: Option<config::InstanceName>,
         /// Project directory used to select an associated stopped instance
         #[arg(long)]
@@ -346,7 +361,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Command to run (non-interactive, no PTY)
@@ -358,7 +373,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Prompt for permissions instead of skipping them
@@ -377,7 +392,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Extra arguments passed to `claude agents`
@@ -389,7 +404,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Keep Codex's sandbox and approval prompts instead of bypassing them
@@ -489,7 +504,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Local directory to push (defaults to `workspace.json` `host_path`)
@@ -507,7 +522,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Local directory to pull into (defaults to `workspace.json` `host_path`)
@@ -529,7 +544,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Command and arguments to run (after `--`)
@@ -752,7 +767,7 @@ enum AgentAction {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Update Claude Code (default: update every agent)
@@ -1019,6 +1034,17 @@ pub fn run() -> Result<()> {
     init_tracing(cli.verbose);
 
     #[cfg(target_os = "linux")]
+    if let Commands::DiskOp {
+        ref operation,
+        ref root,
+        ref path,
+        ref argument,
+    } = cli.command
+    {
+        return privileged_disk::run(operation, root, path, argument.as_deref());
+    }
+
+    #[cfg(target_os = "linux")]
     if let Commands::PatchGuestNetwork {
         ref mount,
         ref hostname,
@@ -1092,6 +1118,7 @@ pub fn run() -> Result<()> {
     }
 
     let mut cfg = config::CoopConfig::load(&cli.config)?;
+    private_storage::prepare(&cfg).context("Failed to prepare private coop storage")?;
     cli.command.apply_github_override(&mut cfg);
     update::maybe_print_notify(&cfg.updates);
     update::maybe_run_background_check(&cfg.updates);
@@ -1100,6 +1127,8 @@ pub fn run() -> Result<()> {
 
     let raw_args: Vec<String> = std::env::args().collect();
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Commands::DiskOp { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::PatchGuestNetwork { .. } => unreachable!("handled before config loading"),
         Commands::Up {
