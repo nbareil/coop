@@ -6745,7 +6745,39 @@ test_post_start() {
 
     coop destroy "$inst_name" 2>/dev/null || true
     untrack_instance "$inst_name"
+    test_post_start_mount
     test_post_start_failure
+}
+
+test_post_start_mount() {
+    local inst_name="${INSTANCE}-poststart-mount"
+    local marker="/tmp/coop-mount-post-start-$$.marker"
+    local mount_dir="$tmpdir/${inst_name}-data"
+    mkdir -p "$mount_dir"
+    printf '%s\n' 'mount-only-ready' > "$mount_dir/input.txt"
+
+    if coop up "$mount_dir" --name "$inst_name" --no-agents --mount \
+        --post-start "cat /workspace/input.txt > $marker"; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "up with mount-only post-start exits 0"
+    else
+        fail "up with mount-only post-start exits 0" "exit code: $?"
+        return
+    fi
+
+    GUEST_INSTANCE="$inst_name"
+    local seen
+    seen=$(guest_exec cat "$marker" 2>/dev/null) || seen=""
+    unset GUEST_INSTANCE
+
+    if [[ "$seen" == "mount-only-ready" ]]; then
+        pass "post-start reads mount-only contents during startup"
+    else
+        fail "post-start reads mount-only contents during startup" "got: '$seen'"
+    fi
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
 }
 
 test_post_start_failure() {
