@@ -6801,6 +6801,7 @@ test_guest_files() {
     else
         fail "agent bootstrap runs after guest_files copies" "$HARNESS_ERR"
     fi
+    test_guest_files_reprovision "$inst_name" "$cfg" "$source"
     test_guest_files_symlink "$inst_name" "$cfg"
     unset GUEST_INSTANCE
     coop destroy "$inst_name"
@@ -6852,6 +6853,36 @@ check_guest_files_initial_copy() {
         pass "guest_files preserves contents and modes and leaves neighboring config writable"
     else
         fail "guest_files preserves contents and modes and leaves neighboring config writable"
+    fi
+}
+
+# shellcheck disable=SC2016 # Inspect restored copies inside the guest.
+test_guest_files_reprovision() {
+    local inst_name=$1 cfg=$2 source=$3
+    if ! guest_exec bash -c 'echo old-disk > ~/.coop-guest-files-old-disk &&
+        test "$(cat ~/.coop-guest-files-old-disk)" = old-disk'; then
+        fail "seed guest_files reprovision disk witness" "stderr: $(guest_stderr)"
+        return
+    fi
+    printf '%s\n' 'reprovision-directory' > "$source/hooks/.input"
+    printf '%s\n' 'reprovision-file' > "$source/single"
+    if coop --config "$cfg" restore "$inst_name" --reprovision --no-agents --no-prompt -y; then
+        pass "guest_files restore --reprovision exits 0"
+    else
+        fail "guest_files restore --reprovision exits 0" "$HARNESS_ERR"
+        return
+    fi
+    if guest_exec bash -c 'test ! -e ~/.coop-guest-files-old-disk'; then
+        pass "guest_files reprovision replaces the guest disk"
+    else
+        fail "guest_files reprovision replaces the guest disk" "stderr: $(guest_stderr)"
+    fi
+    if guest_exec bash -c 'test "$(cat ~/.config/coop-test-hooks/.input)" = reprovision-directory &&
+        test "$(cat ~/.coop-test-file)" = reprovision-file'; then
+        pass "guest_files reprovision restores directory and file mappings"
+    else
+        fail "guest_files reprovision restores directory and file mappings" \
+            "stderr: $(guest_stderr)"
     fi
 }
 

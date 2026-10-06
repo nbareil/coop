@@ -273,7 +273,8 @@ validation, source snapshots, private writable modes, macOS staging ACL inherita
 symlink materialization,
 cycles, missing sources, special files, concurrent source-path replacement, staging
 directory overlap, and mount/destination overlaps. The full
-VM suite checks initial copies, restart refresh, retained guest-only content,
+VM suite checks initial copies, restart refresh, reprovisioned directory and file
+mappings, retained guest-only content,
 writable neighboring configuration directories, bootstrap ordering, and restart
 rejection of persisted live host mounts.
 
