@@ -2434,6 +2434,21 @@ mod tests {
         let recipe = inst.dir.join("creation.json");
         let before = std::fs::read(&recipe).unwrap();
         std::fs::write(inst.pid_file_path(), std::process::id().to_string()).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            // Inspect the real child without granting the fixture other privileged operations.
+            let sudo = root.join("sudo");
+            let script = format!(
+                "#!/bin/bash\nset -euo pipefail\n\
+                 [ \"$#\" -eq 2 ] && [ \"$1\" = cat ] && \\\n                 [ \"$2\" = /proc/{}/cmdline ] || exit 1\n\
+                 exec /bin/cat -- \"$2\"\n",
+                std::process::id()
+            );
+            std::fs::write(&sudo, script).unwrap();
+            std::fs::set_permissions(sudo, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let backend = crate::backend::PlatformBackend::new();
         assert!(backend.is_running(&inst));
         let config_path = root.join("config.toml");
