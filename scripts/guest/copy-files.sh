@@ -31,9 +31,9 @@ fi
 if [[ -d $stage/payload ]]; then
     [[ ! -e $destination || -d $destination ]] || fail "destination is not a directory"
     mkdir -p -- "$destination"
-    rsync -rltp --chmod=Du=rwx,Dgo=,Fu=rwX,Fgo= -- "$stage/payload/" "$destination/"
+    rsync -rltp --ignore-times --chmod=Du=rwx,Dgo=,Fu=rwX,Fgo= -- "$stage/payload/" "$destination/"
 else
     [[ ! -d $destination ]] || fail "file destination is a directory"
     mkdir -p -- "$(dirname -- "$destination")"
-    rsync -ltp --chmod=Fu=rwX,Fgo= -- "$stage/payload" "$destination"
+    rsync -ltp --ignore-times --chmod=Fu=rwX,Fgo= -- "$stage/payload" "$destination"
 fi

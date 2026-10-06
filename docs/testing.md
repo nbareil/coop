@@ -277,6 +277,11 @@ VM suite checks initial copies, restart refresh, retained guest-only content,
 writable neighboring configuration directories, bootstrap ordering, and restart
 rejection of persisted live host mounts.
 
+`bash tests/guest-files-copy.sh` checks the guest copy script on Linux without a
+VM. CI runs it to verify that directory and single-file mappings overwrite changed
+bytes even when size and modification time match, while retaining guest-only files.
+Pass a copy-script path as the first argument to check a deliberate regression.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real
