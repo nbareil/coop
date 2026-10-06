@@ -1416,6 +1416,7 @@ fn run_configured_post_start(
     let Some(command) = opts.post_start_override.or(cfg.post_start.as_deref()) else {
         return Ok(());
     };
+    signal::check_shutdown()?;
     // Bootstrap may mint a proxy capability token; construct this session afterward.
     let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
     backend::run_post_start(&session, command);
@@ -2337,6 +2338,64 @@ mod tests {
             data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
+    }
+
+    #[test]
+    fn post_start_stops_before_session_preparation_when_interrupted() {
+        const CHILD: &str = "COOP_POST_START_INTERRUPTED_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(
+                        "commands::lifecycle::tests::",
+                        "post_start_stops_before_session_preparation_when_interrupted",
+                    ),
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        assert_interrupted_post_start();
+    }
+
+    fn assert_interrupted_post_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = instance_named("test", tmp.path());
+        std::fs::create_dir(inst.model_state_path()).unwrap();
+        let mut cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        cfg.post_start = Some("true".to_string());
+        let target = super::backend::SshTarget {
+            host: super::backend::Hostname::new("127.0.0.1").unwrap(),
+            port: std::num::NonZeroU16::new(22).unwrap(),
+            user: super::backend::SshUser::new("ubuntu").unwrap(),
+            key_path: tmp.path().join("id_test"),
+        };
+        let opts = start_opts(Vec::new(), tmp.path());
+        let error =
+            super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap_err();
+        assert!(format!("{error:#}").contains("model.json"), "{error:#}");
+        let _signals = super::signal::install_handlers();
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(super::signal::shutdown_requested());
+        let error =
+            super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap_err();
+        assert_eq!(error.to_string(), "Interrupted by signal — cleaning up");
+        cfg.post_start = None;
+        super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap();
     }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
