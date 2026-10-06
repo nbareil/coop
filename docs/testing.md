@@ -5,6 +5,39 @@ and three manual quality checks — mutation testing, fuzzing, and formal
 verification (kani). Only the integration and unit tests run in CI; the other
 three are manual, run when a change warrants them.
 
+## Cross-platform compile and lint checks
+
+The workspace uses compile-time backend selection. `cargo clippy --all-targets`
+checks library, binary, test, and example targets for the current Rust target;
+it does not compile another operating system's `#[cfg]` branches.
+
+When a change adds or modifies a platform `#[cfg]`, `PlatformBackend` alias,
+platform-only enum variant, constant, trait implementation, or call path, run
+check and clippy for every affected OS. Prefer a native host. A configured
+cross target is useful compile evidence when native hardware is unavailable:
+
+```bash
+# Native host target
+cargo check --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Example: exercise normal Linux compilation from another host
+rustup target add x86_64-unknown-linux-musl
+cargo check --workspace --target x86_64-unknown-linux-musl
+cargo clippy --workspace --all-targets --all-features \
+  --target x86_64-unknown-linux-musl -- -D warnings
+```
+
+Use the target triple that matches the affected platform and available build
+prerequisites. A cross-target compile is not native runtime or VM-backend
+evidence; report that distinction and every target not checked.
+
+Inspect normal library compilation separately from tests. `cfg(test)` can make
+a platform-only item appear used in unit tests while the ordinary library build
+still rejects it as dead code under `-D warnings`. Gate declarations with the
+same platform conditions as their production consumers instead of suppressing
+that warning, unless the item intentionally forms a supported public surface.
+
 ## Integration tests
 
 VM integration uses two scripts:
