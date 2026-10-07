@@ -585,8 +585,9 @@ coop logs my-project -f
 
 ### `push`
 
-Copy a local directory into the running VM at `/workspace`. Defaults to the
-host path recorded when the instance was created with `coop up`.
+Copy a local directory into the running VM at the recorded guest path (usually
+`/workspace`). Defaults to the host path recorded when the instance was created
+with `coop up`.
 
 ```
 coop push [NAME] [FLAGS]
@@ -609,7 +610,7 @@ coop push my-project --dir ./src --force
 
 ### `pull`
 
-Copy the VM's `/workspace` to a local directory. Defaults to the host path
+Copy the VM's recorded guest path to a local directory. Defaults to the host path
 recorded when the instance was created with `coop up`. Pulled files are
 controlled by the untrusted guest and may be malicious. Review them before
 executing them or interpreting them with Git, editors, build tools, shells, or
