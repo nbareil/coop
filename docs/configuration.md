@@ -96,8 +96,11 @@ rerun hooks when you reconnect.
 
 Commands must tolerate retries: interruption after a command succeeds but before
 its success is recorded can cause it to run again. Host-side progress is reset
-before a disk restore. `restore --reprovision` copies the workspace before rerunning
-the saved recipe. Plain `restore` does not copy the workspace; use reprovisioning
+before a disk restore. If replacement fails and the original disk is proven unchanged,
+completion is preserved. A missing, replaced, or unverifiable disk keeps the recipe
+pending. Abrupt termination during restore can also leave it pending on the original
+disk. `restore --reprovision` copies the workspace before rerunning the saved recipe.
+Plain `restore` does not copy the workspace; use reprovisioning
 when the restored image does not contain the project files that setup needs.
 Older instances without `creation.json` remain unchanged and do not automatically
 pick up new creation hooks.

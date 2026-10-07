@@ -64,7 +64,7 @@ pub(crate) enum Preparation {
     Ready,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Stage {
     command: CreationCommand,
     completion: Completion,
@@ -79,7 +79,7 @@ impl Stage {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreationState {
     preparation: Preparation,
@@ -201,12 +201,46 @@ pub(crate) struct CreationIncomplete {
     source: anyhow::Error,
 }
 
-pub(crate) fn invalidate(inst: &Instance) -> Result<()> {
-    if let Some(mut state) = CreationState::load(inst)? {
-        state.reset();
-        state.save(inst)?;
+/// Reset progress before disk replacement, preserving completion on an intact-disk failure.
+pub(crate) fn restore_disk(
+    inst: &Instance,
+    disk: &std::path::Path,
+    restore: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let Some(original) = CreationState::load(inst)? else {
+        return restore();
+    };
+    let directory = crate::fs_util::PrivateDir::open_existing(
+        disk.parent().context("Instance disk has no parent")?,
+    )?;
+    let name = disk.file_name().context("Instance disk has no name")?;
+    let pinned = directory
+        .pin_existing_regular(name)
+        .context("Cannot pin instance disk before restore")?;
+    let mut reset = original.clone();
+    reset.reset();
+    reset.save(inst)?;
+    let Err(error) = restore() else {
+        return Ok(());
+    };
+    let unchanged = match pinned
+        .as_ref()
+        .map(|file| directory.names_file(name, file))
+        .transpose()
+    {
+        Ok(unchanged) => unchanged.unwrap_or(false),
+        Err(probe) => {
+            return Err(error).context(format!(
+                "Cannot verify instance disk; creation hooks remain pending: {probe:#}"
+            ));
+        }
+    };
+    if unchanged && let Err(rollback) = original.save(inst) {
+        return Err(error).context(format!(
+            "Disk is unchanged, but cannot restore creation-hook progress: {rollback:#}"
+        ));
     }
-    Ok(())
+    Err(error)
 }
 
 pub(crate) fn pending(inst: &Instance) -> Result<bool> {
@@ -341,7 +375,7 @@ mod tests {
     use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
     use crate::creation_hooks::{
         Completion, CreationCommand, CreationProgress, CreationState, Preparation, ensure_complete,
-        ensure_prepared, execute_staged, invalidate, pending, script, set_preparation,
+        ensure_prepared, execute_staged, pending, restore_disk, script, set_preparation,
         wait_for_hook,
     };
     use std::fs;
@@ -469,6 +503,221 @@ mod tests {
         assert!(ensure_complete(&inst).is_err());
     }
 
+    fn completed_restore_fixture(root: &Path) -> (Instance, std::path::PathBuf) {
+        let inst = instance(root);
+        let cfg = CoopConfig {
+            post_create: Some("saved setup".into()),
+            post_start: Some("saved startup".into()),
+            ..CoopConfig::default()
+        };
+        let mut state = CreationState::select(&cfg, None).unwrap();
+        state.preparation = Preparation::Ready;
+        state.global.as_mut().unwrap().completion = Completion::Succeeded;
+        state.save(&inst).unwrap();
+        let disk = root.join("disk");
+        fs::write(&disk, "old disk").unwrap();
+        (inst, disk)
+    }
+
+    #[test]
+    fn failed_restore_preserves_completed_progress_on_original_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let (inst, disk) = completed_restore_fixture(root.path());
+        let original = fs::read(root.path().join("creation.json")).unwrap();
+        let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
+            assert!(pending(&inst).unwrap());
+            anyhow::bail!("copy failed before replacement")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("copy failed before replacement"));
+        assert_eq!(fs::read(&disk).unwrap(), b"old disk");
+        assert_eq!(
+            fs::read(root.path().join("creation.json")).unwrap(),
+            original
+        );
+        assert!(!pending(&inst).unwrap());
+    }
+
+    #[test]
+    fn destructive_restore_failures_keep_progress_pending() {
+        for change in ["removed", "replaced", "symlink", "missing initially"] {
+            let root = tempfile::tempdir().unwrap();
+            let (inst, disk) = completed_restore_fixture(root.path());
+            if change == "missing initially" {
+                fs::remove_file(&disk).unwrap();
+            }
+            let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
+                if change != "missing initially" {
+                    fs::remove_file(&disk)?;
+                }
+                if change == "replaced" {
+                    fs::write(&disk, "replacement disk")?;
+                } else if change == "symlink" {
+                    symlink(root.path().join("creation.json"), &disk)?;
+                }
+                anyhow::bail!("replacement did not finish")
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), "replacement did not finish");
+            let state = CreationState::load(&inst).unwrap().unwrap();
+            assert!(state.pending(), "{change}");
+            assert_eq!(state.preparation, Preparation::Waiting, "{change}");
+            assert_eq!(state.post_start.as_deref(), Some("saved startup"));
+        }
+    }
+
+    #[test]
+    fn successful_restore_keeps_progress_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let (inst, disk) = completed_restore_fixture(root.path());
+        crate::creation_hooks::restore_disk(&inst, &disk, || {
+            fs::remove_file(&disk)?;
+            fs::write(&disk, "new disk")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fs::read(&disk).unwrap(), b"new disk");
+        assert!(pending(&inst).unwrap());
+    }
+
+    #[test]
+    fn unsafe_disk_or_corrupt_progress_prevents_restore() {
+        for failure in ["symlink", "hardlink", "corrupt recipe"] {
+            let root = tempfile::tempdir().unwrap();
+            let (inst, disk) = completed_restore_fixture(root.path());
+            let recipe = root.path().join("creation.json");
+            let before = fs::read(&recipe).unwrap();
+            if failure == "symlink" {
+                fs::remove_file(&disk).unwrap();
+                symlink(&recipe, &disk).unwrap();
+            } else if failure == "hardlink" {
+                fs::hard_link(&disk, root.path().join("alias")).unwrap();
+            } else {
+                fs::write(&recipe, "invalid").unwrap();
+            }
+            let called = std::cell::Cell::new(false);
+            assert!(
+                crate::creation_hooks::restore_disk(&inst, &disk, || {
+                    called.set(true);
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert!(!called.get(), "{failure}");
+            if failure != "corrupt recipe" {
+                assert_eq!(fs::read(&recipe).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn unverifiable_disk_keeps_progress_pending_and_reports_probe_error() {
+        // Permission failures cannot be reproduced by an effective root user.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (inst, disk) = completed_restore_fixture(root.path());
+        let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000))?;
+            anyhow::bail!("copy failed with unverifiable disk")
+        });
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let error = format!("{:#}", error.unwrap_err());
+        assert!(error.contains("Cannot verify instance disk"), "{error}");
+        assert!(
+            error.contains("copy failed with unverifiable disk"),
+            "{error}"
+        );
+        assert!(pending(&inst).unwrap());
+        assert_eq!(fs::read(&disk).unwrap(), b"old disk");
+    }
+
+    #[test]
+    fn progress_write_failure_prevents_disk_restore() {
+        if let Some(root) = std::env::var_os("COOP_RESTORE_WRITE_FAILURE") {
+            let root = std::path::Path::new(&root);
+            let (inst, disk) = completed_restore_fixture(root);
+            let original = fs::read(root.join("creation.json")).unwrap();
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: only this isolated test child changes its signal handler and file limit.
+            unsafe {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const limit), 0);
+            }
+            let called = std::cell::Cell::new(false);
+            let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
+                called.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Cannot save creation-hook progress")
+            );
+            assert!(!called.get());
+            assert_eq!(fs::read(root.join("creation.json")).unwrap(), original);
+            assert!(!pending(&inst).unwrap());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "creation_hooks::tests::progress_write_failure_prevents_disk_restore",
+            ])
+            .env("COOP_RESTORE_WRITE_FAILURE", root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn rollback_failure_reports_both_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let (inst, disk) = completed_restore_fixture(root.path());
+        let recipe = root.path().join("creation.json");
+        let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
+            fs::rename(&recipe, root.path().join("pending.json"))?;
+            fs::create_dir(&recipe)?;
+            anyhow::bail!("disk copy failed")
+        })
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("cannot restore creation-hook progress"),
+            "{error}"
+        );
+        assert!(error.contains("disk copy failed"), "{error}");
+        assert_eq!(fs::read(&disk).unwrap(), b"old disk");
+        assert!(CreationState::load(&inst).is_err());
+    }
+
+    #[test]
+    fn legacy_restore_has_no_creation_progress_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let inst = instance(root.path());
+        let called = std::cell::Cell::new(false);
+        let error =
+            crate::creation_hooks::restore_disk(&inst, &root.path().join("missing"), || {
+                called.set(true);
+                anyhow::bail!("legacy restore failed")
+            })
+            .unwrap_err();
+        assert!(called.get());
+        assert_eq!(error.to_string(), "legacy restore failed");
+        assert!(!root.path().join("creation.json").exists());
+    }
+
     #[test]
     fn completed_hook_is_skipped_and_restore_resets_progress() {
         let root = tempfile::tempdir().unwrap();
@@ -492,7 +741,7 @@ mod tests {
         );
         assert!(!pending(&inst).unwrap());
         assert!(ensure_complete(&inst).is_ok());
-        invalidate(&inst).unwrap();
+        restore_disk(&inst, &root.path().join("missing-disk"), || Ok(())).unwrap();
         let state = CreationState::load(&inst).unwrap().unwrap();
         assert!(ensure_prepared(&state).is_err());
         assert_eq!(
@@ -506,7 +755,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let inst = instance(root.path());
         assert!(ensure_complete(&inst).is_ok());
-        invalidate(&inst).unwrap();
+        restore_disk(&inst, &root.path().join("missing-disk"), || Ok(())).unwrap();
         assert!(!root.path().join("creation.json").exists());
         set_preparation(&inst, Preparation::Ready).unwrap();
         assert!(!root.path().join("creation.json").exists());
@@ -518,7 +767,7 @@ mod tests {
         fs::write(root.path().join("creation.json"), "invalid").unwrap();
         assert!(pending(&inst).is_err());
         assert!(ensure_complete(&inst).is_err());
-        assert!(invalidate(&inst).is_err());
+        assert!(restore_disk(&inst, &root.path().join("missing-disk"), || Ok(())).is_err());
     }
 
     #[test]
@@ -528,7 +777,7 @@ mod tests {
         fs::create_dir(root.path().join("creation.json")).unwrap();
         assert!(CreationState::load(&inst).is_err());
         assert!(ensure_complete(&inst).is_err());
-        assert!(invalidate(&inst).is_err());
+        assert!(restore_disk(&inst, &root.path().join("missing-disk"), || Ok(())).is_err());
     }
 
     #[test]

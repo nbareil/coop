@@ -287,7 +287,8 @@ bytes even when size and modification time match, while retaining guest-only fil
 Pass a copy-script path as the first argument to check a deliberate regression.
 
 Creation-hook tests cover shell strings, invalid commands, private recipe
-storage, completion progress, legacy instances, restore invalidation, startup-hook
+storage, completion progress, legacy instances, restore invalidation and
+unchanged-disk failure rollback, startup-hook
 precedence, and shell quoting. Recipe reads and writes reject unsafe links and
 ancestors. An isolated SSH fixture checks that creation hooks receive guest
 environment values without changing host executable lookup or loader settings.

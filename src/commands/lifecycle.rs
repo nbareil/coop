@@ -2011,13 +2011,14 @@ pub(crate) fn cmd_restore(
     }
 
     let stopped = be.as_stopped(inst)?;
-    crate::creation_hooks::invalidate(stopped.instance())?;
-    be.restore_disk(cfg, &stopped, image)?;
+    crate::creation_hooks::restore_disk(
+        stopped.instance(),
+        &be.disk_path(stopped.instance())?,
+        || be.restore_disk(cfg, &stopped, image),
+    )?;
 
-    // Persist the new lineage after the disk swap: if `restore_disk` fails,
-    // the recorded image still matches the (untouched) disk. The only
-    // residual window is a failed `instance.json` write after a successful
-    // swap, which re-running `restore` corrects.
+    // Persist lineage only after replacement finishes. A failed copy or network
+    // patch can leave a partial disk; re-running restore completes replacement.
     let mut restored = stopped.instance().clone();
     restored.set_image(image.clone())?;
 
@@ -2165,8 +2166,11 @@ fn reprovision_instance(
     // the swap. This is the longest window before the point of no return.
     signal::check_shutdown()?;
 
-    crate::creation_hooks::invalidate(stopped.instance())?;
-    be.restore_disk(cfg, &stopped, &image)?;
+    crate::creation_hooks::restore_disk(
+        stopped.instance(),
+        &be.disk_path(stopped.instance())?,
+        || be.restore_disk(cfg, &stopped, &image),
+    )?;
 
     // Past this point the old disk is gone and there is nothing to roll back
     // to, so every remaining step carries the same recovery advice: the
@@ -2176,8 +2180,7 @@ fn reprovision_instance(
     // measures the replaced template-sized file and skips the re-grow.
     let partial = || reprovision_partial_message(&reprovisioned_name, &image, previous_disk);
 
-    // Persist the new lineage after the swap: if `restore_disk` failed the
-    // recorded image still matches the untouched disk.
+    // Persist lineage only after replacement finishes.
     let mut inst = stopped.instance().clone();
     inst.set_image(image.clone()).with_context(partial)?;
 

@@ -854,9 +854,12 @@ Kept across the wipe, because coop persists them host-side:
 | Workspace association (copy, git clone, or mount) | `workspace.json` |
 | Port forwards | `forwards.json` |
 | Guest env | `guest_env.json` |
-| Creation command and its deferred startup command | `creation.json`; creation progress is reset before the disk replacement |
+| Creation recipe and deferred startup | `creation.json`; disk replacement resets progress |
 | Model mode and proxy settings | `model.json` / `proxy.json` |
 | Credentials saved in the host secret store | unchanged; guest forwarding depends on the configured auth mode |
+
+A failed disk replacement preserves completed creation-hook progress when the original
+disk is proven unchanged.
 
 **Not replayed**, because coop does not persist them:
 
