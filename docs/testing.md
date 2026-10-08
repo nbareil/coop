@@ -38,6 +38,91 @@ still rejects it as dead code under `-D warnings`. Gate declarations with the
 same platform conditions as their production consumers instead of suppressing
 that warning, unless the item intentionally forms a supported public surface.
 
+## Linux unit tests from macOS
+
+For changes to Linux-only `#[cfg]` branches, Firecracker host-side logic, Linux
+test targets, or platform-specific code, macOS developers should use this
+optional pre-push check. It is not a CI gate or a prerequisite for ordinary
+macOS-only changes. Native Linux developers should run `cargo test --workspace`
+instead. The Docker runner builds the current tracked working-tree
+sources inside Linux and runs the full workspace by default:
+
+```bash
+./tests/run-linux-unit.sh
+./tests/run-linux-unit.sh -p coop --test firecracker_socket
+./tests/run-linux-unit.sh -- --nocapture  # full workspace with test output
+python3 tests/test-linux-unit-runner.py  # host-only runner regressions; no Docker needed
+```
+
+Prerequisites are Python 3, Git, a Docker-compatible CLI and daemon (for example,
+Docker Desktop or Colima), and macOS arm64 or x86_64. Apple Silicon selects
+native `linux/arm64`; Intel selects native `linux/amd64`. An explicit
+`--platform linux/amd64` or `--platform linux/arm64` is an
+explicit override; the runner warns when it differs from the host architecture
+because emulation may change process behavior. It detects Apple Silicon even
+when Python itself runs through Rosetta. The Rust image uses the version
+in `rust-toolchain.toml`. `tests/linux-unit.Dockerfile` pins the matching
+`rust:<version>-bookworm` multi-architecture image digest. When the toolchain
+changes, update its tag and digest together; the runner rejects a tag mismatch.
+Update the Dockerfile's `RUSTUP_TOOLCHAIN` override at the same time. It selects
+the already-installed image toolchain without downloading unused components on
+each run. The runner checks `rustc --version` inside the container before
+staging sources.
+The Dockerfile package list includes the packages installed by
+`.github/workflows/ci.yml`; `tests/test-linux-unit-runner.py` checks that
+relationship, so update both when CI prerequisites change.
+
+The runner archives only files tracked in the Git index, reading their current
+working-tree contents and modes. Staged additions are included; untracked files,
+tracked deletions, `.git`, `target`, ignored paths, and credential-like paths are
+not copied. If an existing tracked path is ignored or looks private, the runner
+fails loudly instead of silently testing an incomplete source tree. It extracts
+the archive onto the container filesystem and runs Cargo as a non-root user with
+container-local passwordless sudo. It does not mount the source tree, Docker
+socket, KVM, or host credentials.
+Docker's normal container `/proc`, loopback, Unix sockets, and filesystem
+semantics apply. Only PATH, HOME, and Docker connection/configuration variables
+reach the Docker CLI;
+none of the caller's other environment is forwarded to it or the container.
+Cargo registry, Git, and target caches are Docker volumes named by Rust version
+and Linux architecture. A lock serializes workspace clean, build, and test on
+the shared target volume; workspace artifacts are rebuilt from each staged
+source tree while dependency artifacts remain cached. To reclaim the caches,
+list and remove the matching volumes:
+
+```bash
+docker volume ls --filter name=coop-linux-unit-
+docker volume rm $(docker volume ls -q --filter name=coop-linux-unit-)
+```
+
+This is an early-warning layer for Linux-only code and test targets, and for
+container-available `/proc`, process, signal, Unix-socket, filesystem-mode,
+symlink, and permission behavior. It also exercises Firecracker host-side logic
+that does not need a real VM, KVM, TAP device, system service, or host network
+mutation. It does **not** establish Firecracker boot or KVM behavior; real TAP,
+bridge, iptables, forwarding, or host-routing behavior; systemd integration or
+the host's sudoers policy; macOS/Lima correctness; x86-64 Linux runtime
+correctness when run natively as arm64; or full lifecycle, guest-visible,
+installation, update, or release behavior. Tests requiring broader container
+privileges are unsupported here.
+
+In this Docker image, the `firecracker_socket` fixture runs its exact socket
+helper as the test user. Docker's default capabilities do not allow root to
+execute another user's `/proc/<pid>/exe`. The fixture still exercises the real
+`coop stop` path, asserts the helper runs on every attempt, and keeps other
+`sudo` calls real. Ordinary native Linux workspace tests, including Linux CI,
+use real `sudo` for this probe as before. The Docker result does not establish
+privileged access to a root-owned Firecracker socket; the real
+Linux/Firecracker integration gate remains necessary for that behavior.
+
+A green Docker run does **not** replace either platform integration gate.
+Lifecycle and guest-visible changes still require both real backends:
+
+```bash
+./tests/run-integration.sh                       # macOS/Lima
+./tests/run-integration.sh --remote user@host    # Linux/Firecracker
+```
+
 ## Integration tests
 
 VM integration uses two scripts:
