@@ -54,9 +54,10 @@ sources inside Linux and runs the full workspace by default:
 python3 tests/test-linux-unit-runner.py  # host-only runner regressions; no Docker needed
 ```
 
-Prerequisites are Python 3, Git, Docker Desktop with its daemon running, and
-macOS arm64 or x86_64. Apple Silicon selects native `linux/arm64`; Intel selects
-native `linux/amd64`. `--platform linux/amd64` or `--platform linux/arm64` is an
+Prerequisites are Python 3, Git, a Docker-compatible CLI and daemon (for example,
+Docker Desktop or Colima), and macOS arm64 or x86_64. Apple Silicon selects
+native `linux/arm64`; Intel selects native `linux/amd64`. An explicit
+`--platform linux/amd64` or `--platform linux/arm64` is an
 explicit override; the runner warns when it differs from the host architecture
 because emulation may change process behavior. It detects Apple Silicon even
 when Python itself runs through Rosetta. The Rust image uses the version
@@ -73,10 +74,12 @@ relationship, so update both when CI prerequisites change.
 
 The runner archives only files tracked in the Git index, reading their current
 working-tree contents and modes. Staged additions are included; untracked files,
-tracked deletions, `.git`, `target`, ignored paths (even if force-staged), and
-credential-like paths are excluded. It extracts the archive onto the container
-filesystem and runs Cargo as a non-root user with container-local passwordless
-sudo. It does not mount the source tree, Docker socket, KVM, or host credentials.
+tracked deletions, `.git`, `target`, ignored paths, and credential-like paths are
+not copied. If an existing tracked path is ignored or looks private, the runner
+fails loudly instead of silently testing an incomplete source tree. It extracts
+the archive onto the container filesystem and runs Cargo as a non-root user with
+container-local passwordless sudo. It does not mount the source tree, Docker
+socket, KVM, or host credentials.
 Docker's normal container `/proc`, loopback, Unix sockets, and filesystem
 semantics apply. Only PATH, HOME, and Docker connection/configuration variables
 reach the Docker CLI;

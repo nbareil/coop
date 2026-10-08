@@ -52,7 +52,7 @@ class RunnerTests(unittest.TestCase):
         (self.root / ".env").write_text("PRIVATE\n")
         (self.root / "credentials.json").write_text("PRIVATE\n")
         subprocess.run(["git", "-C", str(self.root), "add", "Cargo.toml", "changed.rs",
-                        "link", "executable.sh", ".env", "credentials.json"], check=True)
+                        "link", "executable.sh"], check=True)
         (self.root / "changed.rs").write_text("working tree edit\n")
         os.utime(self.root / "changed.rs", (1_600_000_000, 1_600_000_000))
         (self.root / "target").mkdir()
@@ -60,9 +60,8 @@ class RunnerTests(unittest.TestCase):
         (self.root / "ignored-secret").write_text("PRIVATE\n")
         (self.root / ".claude").mkdir()
         (self.root / ".claude/settings.local.json").write_text("PRIVATE\n")
-        (self.root / ".gitignore").write_text("ignored-secret\n.claude/settings.local.json\n")
-        subprocess.run(["git", "-C", str(self.root), "add", "-f",
-                        ".claude/settings.local.json"], check=True)
+        (self.root / ".gitignore").write_text(
+            "ignored-secret\n.claude/settings.local.json\n.env\ncredentials.json\n")
         self.log = self.root / "docker-log"
         selected, _ = RUNNER.selected_platform("Darwin", RUNNER.host_machine())
         (self.root / "expected-arch").write_text(
@@ -142,6 +141,20 @@ if sys.argv[1] == "exec" and "flock" in sys.argv and (root / "fake-cargo-sleep")
                                  name == "ignored-secret" or name.startswith(".claude/")
                                  for name in names))
         self.assertIn(Path("src/secret_store.rs"), RUNNER.source_paths(ROOT))
+
+    def test_tracked_exclusions_fail_loudly(self):
+        tracked = self.root / "linux_regression.rs"
+        tracked.write_text("tracked source\n")
+        subprocess.run(["git", "-C", str(self.root), "add", "linux_regression.rs"], check=True)
+        with (self.root / ".gitignore").open("a") as ignore:
+            ignore.write("linux_regression.rs\n")
+        with self.assertRaisesRegex(ValueError, "refusing to omit tracked.*linux_regression"):
+            RUNNER.source_paths(self.root)
+        subprocess.run(["git", "-C", str(self.root), "rm", "--cached", "linux_regression.rs"],
+                       check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "-C", str(self.root), "add", "-f", ".env"], check=True)
+        with self.assertRaisesRegex(ValueError, r"refusing to omit tracked.*\.env"):
+            RUNNER.source_paths(self.root)
 
     def test_forwarding_status_and_cleanup(self):
         result = self.invoke("-p", "coop; touch /tmp/injected", "--test", "firecracker_socket")

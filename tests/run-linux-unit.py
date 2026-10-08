@@ -75,15 +75,14 @@ def source_paths(root):
                                             ignored.stderr)
     ignored_paths = set(ignored.stdout.split(b"\0"))
     paths = []
+    excluded = []
     for raw in result.stdout.split(b"\0"):
-        if not raw or raw in ignored_paths:
+        if not raw:
             continue
         relative = Path(os.fsdecode(raw))
         parts = relative.parts
-        if (relative.is_absolute() or ".." in parts or
-                any(part in PRIVATE_PARTS or part.startswith(PRIVATE_PREFIXES)
-                    or part.endswith(PRIVATE_SUFFIXES) for part in parts)):
-            continue
+        if relative.is_absolute() or ".." in parts:
+            raise ValueError(f"tracked path escapes the repository: {relative}")
         path = root
         for part in parts[:-1]:
             path = path / part
@@ -94,7 +93,17 @@ def source_paths(root):
             if not full.exists():  # A tracked deletion is part of the current tree.
                 continue
             raise ValueError(f"tracked path is not a file or symlink: {relative}")
+        if (raw in ignored_paths or
+                any(part in PRIVATE_PARTS or part.startswith(PRIVATE_PREFIXES)
+                    or part.endswith(PRIVATE_SUFFIXES) for part in parts)):
+            excluded.append(relative)
+            continue
         paths.append(relative)
+    if excluded:
+        names = ", ".join(str(path) for path in excluded)
+        raise ValueError(
+            f"refusing to omit tracked private or ignored paths: {names}; "
+            "remove them from the Git index or rename them")
     return paths
 
 
@@ -143,7 +152,8 @@ def run(argv=None):
         description="Build and run Linux Rust tests on tracked working-tree sources in Docker.",
         epilog=("Optional macOS pre-push check for Linux-specific changes. On native Linux, use "
                 "cargo test --workspace.\n"
-                "Prerequisites: macOS arm64 or x86_64, Python 3, Git, and a running Docker daemon.\n"
+                "Prerequisites: macOS arm64 or x86_64, Python 3, Git, and a running "
+                "Docker-compatible daemon.\n"
                 "Default: cargo test --workspace. Apple Silicon uses native linux/arm64; Intel "
                 "uses native linux/amd64. --platform may use emulation.\n"
                 "Examples:\n  ./tests/run-linux-unit.sh\n"
@@ -170,10 +180,13 @@ def run(argv=None):
         if f"ENV RUSTUP_TOOLCHAIN={version}" not in dockerfile:
             raise ValueError("Dockerfile Rust override differs from rust-toolchain.toml")
         if not which("docker"):
-            raise ValueError("Docker CLI is missing; install Docker Desktop and start it")
+            raise ValueError(
+                "Docker CLI is missing; install Docker Desktop, Colima, or another "
+                "Docker-compatible runtime")
         if docker("info", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                   check=False).returncode:
-            raise ValueError("Docker daemon is unreachable; start Docker Desktop and retry")
+            raise ValueError(
+                "Docker daemon is unreachable; start a Docker-compatible daemon and retry")
         arch = chosen.split("/")[1]
         image = f"coop-linux-unit:{version}-{arch}"
         name = f"coop-linux-unit-{uuid.uuid4().hex}"
