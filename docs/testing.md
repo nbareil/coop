@@ -96,8 +96,10 @@ existing stop failure test checks PID retention after failed forced signals.
 
 `cargo test --test firecracker_socket` exercises the Linux socket helper and
 `coop stop` with a full Unix listener accept queue. It checks proxy-token
-retention and TAP cleanup through a fake `ip` boundary, then closes the listener
-and requires cleanup to succeed. It does not replace either VM integration gate.
+retention, then closes the listener and requires cleanup to succeed. An exact
+`/bin/false` network-tool path reports TAP and bridge objects absent without
+relying on ambient `PATH`; dedicated network tests cover TAP mutation and
+cleanup. This test does not replace either VM integration gate.
 
 The `--full` suite includes a dedicated `--no-github` phase. It captures the
 boot session through `post_start` for fresh `up`, `start`, and a stopped-project
@@ -233,6 +235,19 @@ the positive witness to fail. Do this even when the launch code is excluded
 from cargo-mutants. Run such checks only in an authorized test environment;
 read-only CI review must report them as unrun when contributor execution is
 forbidden. The concrete forwarding checks above implement this pattern for SSH.
+
+The trusted-host-tool unit fixtures use a private synthetic filesystem root so
+they do not depend on tools installed on the development host. They cover fixed
+candidate mapping, missing/relative/writable rejection, trusted symlink hops,
+ambient-`PATH` exclusion, explicit cwd/environment, absolute elevated argv, and
+complete `setup_tap` resolution before the first probe. Tests for configured
+paths cover exact-no-fallback behavior, non-FHS symlink targets, unknown config
+keys, path syntax, cleanup-category independence, and kernel-ordered handling
+of parent components inside symlink targets. The ignored Linux
+network namespace test additionally resolves the production `sudo` and
+`bridge` policy before exercising bridge-port isolation; ordinary unit tests do
+not require the production tools because CI installs those prerequisites only
+for the later isolated network gate.
 
 For file-transfer changes, extend the fixture through the later host operation
 that consumes the transferred data. Use the relevant real tool to exercise
