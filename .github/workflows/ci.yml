@@ -87,6 +87,7 @@ jobs:
 
   nix:
     name: Nix build (${{ matrix.system }})
+    permissions: {}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
