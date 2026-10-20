@@ -51,6 +51,42 @@ Memory and vCPU changes rewrite the `cpus`/`memory` fields in the instance's `li
 
 Lima runs as the current user. No `sudo` is required for any Lima operation: setup, start, stop, or destroy.
 
+### SSH resets or times out while Lima says Running
+
+If a coop command fails with `kex_exchange_identification: read: Connection reset by peer`, or `coop start` times out waiting for SSH, inspect the Lima messages too. A repeated `tcpproxy: error dialing "<guest-ip>:22": ... no route to host` and/or an unavailable vsock guest agent can occur while `limactl list` still says `Running`. That state describes the VZ process, not a completed guest boot or a working SSH server. The address in the message is diagnostic; do not assume it stays the same.
+
+Try the less invasive recovery steps first:
+
+```sh
+coop stop <instance>
+coop start <instance>
+```
+
+Check the host's VPN and network state. If several VZ guests or host networking are affected, reboot macOS and retry. Do not start recovery by running `coop destroy`: it deletes the instance disk. If the same SSH and guest-agent errors persist, they may be symptoms of a guest boot or filesystem failure rather than a host network problem. `coop logs <instance>` and Lima's logs under the instance directory may show where boot stopped.
+
+To inspect the VZ console, stop the instance, enable Lima video output, then start it directly:
+
+```sh
+coop stop <instance>
+limactl edit --tty=false --video coop-<instance>
+limactl start coop-<instance>
+```
+
+The display may show an initramfs prompt asking for a manual `fsck`. Follow the device named by the boot message only after confirming it is the root filesystem and is not mounted. If console repair is unavailable, use the offline procedure below. After diagnosis, stop the VM before touching its disk; `limactl edit --tty=false --video=false coop-<instance>` restores the usual headless display while it is stopped.
+
+#### Offline filesystem repair on macOS
+
+**Never run host-side `fsck` or `e2fsck` on an instance disk while its VM is running.** Filesystem repair changes guest data and can lose damaged files. Keep a separate backup so you can recover the pre-repair disk.
+
+1. Run `coop stop <instance>` and check `limactl list` until `coop-<instance>` is `Stopped`. If a broken VZ process does not stop gracefully, `limactl stop -f coop-<instance>` is a last resort: it kills the VM without a clean guest shutdown and may add filesystem damage. Confirm `Stopped` again before continuing.
+2. Locate the instance directory at `${LIMA_HOME:-$HOME/.lima}/coop-<instance>`. Identify the instance's disk there; Lima versions use `disk` or `diffdisk`, and `disk` may be a symlink to `diffdisk`. Resolve the path to the actual file. Copy that file to a **separate backup location** with enough free space, for example `cp -p "$disk_image" <backup-path>`, and verify the copy completed. Do not use the golden image or another instance's disk.
+3. Install `e2fsprogs` (`brew install e2fsprogs`). Attach the stopped raw instance disk read-only with `hdiutil attach -nomount -readonly -imagekey diskimage-class=CRawDiskImage "$disk_image"`. Note the whole-disk device reported by `hdiutil`, then run `diskutil list /dev/diskN` (replace `diskN` with that device). Identify the Linux ext4 **root partition** from the partition map; do not assume a partition number. If more than one ext4 partition exists, inspect each candidate with `sudo "$(brew --prefix e2fsprogs)/sbin/debugfs" -R 'stat /etc' /dev/rdiskNsY` and use the one containing the guest root directory. Do not select an EFI, swap, or data partition.
+4. Run a read-only diagnostic on the confirmed root partition: `sudo "$(brew --prefix e2fsprogs)/sbin/e2fsck" -fn /dev/rdiskNsY`. Replace `rdiskNsY` with the partition you identified. Record the findings. A nonzero exit status here can mean the read-only check found errors; it has not repaired them.
+5. Detach the disk with `hdiutil detach /dev/diskN`, then attach the same image for writing with `hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$disk_image"`. **Read the new device name and partition map again**; macOS may assign a different `diskN`. Confirm the root partition again, then run `sudo "$(brew --prefix e2fsprogs)/sbin/e2fsck" -fy /dev/rdiskNsY` on that partition only. Exit status `1` means errors were corrected; `0` means no errors were found. Stop and investigate other exit statuses or unresolved errors.
+6. Run `sudo "$(brew --prefix e2fsprogs)/sbin/e2fsck" -fn /dev/rdiskNsY` again. Require a clean result and exit status `0` before booting. Detach with `hdiutil detach /dev/diskN`, then run `coop start <instance>` and verify SSH works.
+
+Keep the backup until the guest boots and its files are checked. If `hdiutil` cannot attach the disk or the root partition cannot be identified confidently, stop rather than guessing which device to repair.
+
 ## Linux / Firecracker
 
 The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.github.io/) with KVM hardware virtualization. Each instance is a lightweight VM with its own rootfs, TAP network device, and Firecracker process.
