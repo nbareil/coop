@@ -36,10 +36,15 @@ pub const HOST_GATEWAY: &str = "host.lima.internal";
 pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     crate::fs_util::private_dir(&cfg.data_dir).context("Failed to create data directory")?;
 
+    let image = &opts.image;
+    let _image_lock = crate::setup::lock_image_publication(cfg, image)?;
+    if !opts.rebuild {
+        crate::setup::validate_image_publication(cfg, image)?;
+    }
+
     check_requirements()?;
     ensure_ssh_key(cfg)?;
 
-    let image = &opts.image;
     let base_img = cfg.lima_base_path(image);
     if base_img.exists()
         && !opts.rebuild
@@ -63,6 +68,7 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     }
 
     generate_start_template(cfg, image)?;
+    crate::setup::finish_image_publication(cfg, image)?;
 
     eprintln!("\nSetup complete.");
     eprintln!("Run `coop up` in a project directory to launch a VM.");
@@ -462,7 +468,12 @@ fn is_top_level_key(line: &str, key: &str) -> bool {
 /// the image's `lima-base.img` and regenerates the fast-start template
 /// so it points at the new base. The caller has gated on the instance
 /// being stopped and decided whether overwriting is allowed.
-pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
+pub fn commit_disk(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    image: &ImageName,
+    metadata: &TemplateConfig,
+) -> Result<()> {
     let (_disk_dir, src, source) = open_instance_disk(inst, DiskAccess::Read)?;
 
     let image_dir = cfg.image_dir(image);
@@ -471,6 +482,7 @@ pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Resu
 
     let base_img = cfg.lima_base_path(image);
     tracing::info!("Committing instance '{}' to image '{image}'", inst.name);
+    crate::setup::begin_image_publication(cfg, image)?;
     image_dir_handle
         .copy_atomic_sparse(
             base_img.file_name().context("Base image has no name")?,
@@ -478,7 +490,9 @@ pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Resu
             0o600,
         )
         .with_context(|| format!("Failed to copy {} -> {}", src.display(), base_img.display()))?;
-    generate_start_template(cfg, image)
+    generate_start_template(cfg, image)?;
+    metadata.save_for(cfg, image)?;
+    crate::setup::finish_image_publication(cfg, image)
 }
 
 /// Replace a stopped instance's disk with image `image`'s base image.
@@ -985,19 +999,21 @@ fn build_golden_image(
         }
     };
 
-    // Swap staging into place — old image is replaced atomically
-    image_dir
-        .rename_child(
-            staging_name,
-            base_img.file_name().context("Base image has no name")?,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to swap staging image {} -> {}",
-                staging.display(),
-                base_img.display()
+    // Keep consumers from using a replaced disk until its metadata is published.
+    publish_lima_disk(cfg, image, || {
+        image_dir
+            .rename_child(
+                staging_name,
+                base_img.file_name().context("Base image has no name")?,
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "Failed to swap staging image {} -> {}",
+                    staging.display(),
+                    base_img.display()
+                )
+            })
+    })?;
 
     #[expect(clippy::cast_precision_loss, reason = "file size fits in f64")]
     let size_gib = image_dir
@@ -1022,10 +1038,20 @@ fn build_golden_image(
         grok_marketplaces: baked.grok_marketplaces,
         grok_plugins: baked.grok_plugins,
         guest_user: guest_user.clone(),
+        capabilities: std::collections::BTreeSet::new(),
     };
     template_config.save_for(cfg, image)?;
 
     Ok(())
+}
+
+fn publish_lima_disk(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    swap: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::setup::begin_image_publication(cfg, image)?;
+    swap()
 }
 
 fn report_builder_inputs(profiles: &[ProfileDef]) {
@@ -2209,6 +2235,70 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn plain_setup_refuses_interrupted_publication_with_matching_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("interrupted").unwrap();
+        let user = GuestUser::default();
+        PrivateDir::create(&cfg.data_dir).unwrap();
+        PrivateDir::create(&cfg.images_dir()).unwrap();
+        PrivateDir::create(&cfg.image_dir(&image)).unwrap();
+        let metadata = TemplateConfig {
+            version: TEMPLATE_VERSION,
+            created: "2026-01-01T00:00:00Z".to_string(),
+            install_script_hash: provision_script_hash(&cfg, &[], &user),
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install_hash: None,
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+            codex_marketplaces: Vec::new(),
+            codex_plugins: Vec::new(),
+            grok_marketplaces: Vec::new(),
+            grok_plugins: Vec::new(),
+            guest_user: user.clone(),
+            capabilities: std::collections::BTreeSet::new(),
+        };
+        metadata.save_for(&cfg, &image).unwrap();
+        assert!(!needs_rebuild(&cfg, &image, &[], &user));
+
+        let disk = cfg.lima_base_path(&image);
+        let staging = disk.with_extension("img.new");
+        fs::write(&disk, b"old disk").unwrap();
+        fs::write(&staging, b"new disk").unwrap();
+        let error = publish_lima_disk(&cfg, &image, || {
+            fs::rename(&staging, &disk)?;
+            anyhow::bail!("injected interruption after rename")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+        assert_eq!(fs::read(&disk).unwrap(), b"new disk");
+
+        let opts = SetupOptions {
+            skip_confirm: true,
+            rebuild: false,
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install: None,
+            image: image.clone(),
+            guest_user: user,
+            builder_timeout: None,
+        };
+        let error = setup(&cfg, &opts).unwrap_err().to_string();
+        assert!(error.contains("incomplete publication"), "{error}");
+        assert!(error.contains("--rebuild"), "{error}");
+        assert_eq!(fs::read(&disk).unwrap(), b"new disk");
+        assert!(
+            cfg.image_dir(&image)
+                .join(".publication-incomplete")
+                .exists()
+        );
+    }
+
+    #[test]
     fn lima_start_disables_interactive_and_graphical_ui() {
         let command = headless_limactl_start();
         let args: Vec<_> = command
@@ -2351,6 +2441,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         let metadata = inst.dir.join("instance.json");
@@ -2542,6 +2633,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root_path.to_path_buf(),
             image: ImageName::new("test.img").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let inst_dir = root_path.join(lima_name(&inst));
         fs::create_dir_all(&inst_dir).unwrap();
@@ -2998,6 +3090,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let mounts = [crate::config::Mount {
             host_path: root.path().into(),
@@ -3045,8 +3138,25 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: image.clone(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
-        commit_disk(&cfg, &inst, &image).unwrap();
+        let metadata = TemplateConfig {
+            version: TEMPLATE_VERSION,
+            created: utc_timestamp(),
+            install_script_hash: Sha256Hash::of("fixture"),
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install_hash: None,
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+            codex_marketplaces: Vec::new(),
+            codex_plugins: Vec::new(),
+            grok_marketplaces: Vec::new(),
+            grok_plugins: Vec::new(),
+            guest_user: GuestUser::default(),
+            capabilities: std::collections::BTreeSet::new(),
+        };
+        commit_disk(&cfg, &inst, &image, &metadata).unwrap();
         let copied = fs::metadata(cfg.lima_base_path(&image)).unwrap();
         assert_eq!(copied.len(), 64 * 1024 * 1024);
         assert!(
