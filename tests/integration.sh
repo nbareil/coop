@@ -947,6 +947,51 @@ test_shell_connectivity() {
     fi
 }
 
+test_firecracker_vsock_transport() {
+    echo ""
+    echo "=== Phase: Firecracker vsock transport ==="
+
+    if [[ "$(uname -s)" != Linux ]]; then
+        skip "Firecracker vsock transport" "Firecracker-only"
+        return
+    fi
+
+    if guest_exec systemctl is-active --quiet coop-vsock-ssh.socket; then
+        pass "guest AF_VSOCK SSH listener is active"
+    else
+        fail "guest AF_VSOCK SSH listener is active" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    local socket_path="$HOME/.coop/instances/$INSTANCE/vsock.sock"
+    local proxy_command
+    printf -v proxy_command '%q __vsock-proxy --socket %q --port 22' \
+        "$BINARY" "$socket_path"
+    local output
+    if output=$(_timeout 30 ssh \
+        -F none \
+        -o BatchMode=yes \
+        -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o GlobalKnownHostsFile=/dev/null \
+        -o IdentitiesOnly=yes \
+        -o IdentityAgent=none \
+        -o "IdentityFile=$HOME/.coop/vm_key" \
+        -o "ProxyCommand=$proxy_command" \
+        ubuntu@coop-vsock printf vsock-control-ok 2>"$tmpdir/vsock-ssh-stderr"); then
+        if [[ "$output" == "vsock-control-ok" ]]; then
+            pass "OpenSSH reaches the guest through the Rust vsock ProxyCommand"
+        else
+            fail "OpenSSH reaches the guest through the Rust vsock ProxyCommand" \
+                "unexpected output: $output"
+        fi
+    else
+        fail "OpenSSH reaches the guest through the Rust vsock ProxyCommand" \
+            "$(cat "$tmpdir/vsock-ssh-stderr" 2>/dev/null)"
+    fi
+}
+
 test_ssh_alias() {
     echo ""
     echo "=== Phase: ssh alias (backward compat) ==="
@@ -2802,14 +2847,20 @@ test_stop() {
             fail "guest address identifies stop TAP" "unexpected guest IPv4 address: $ip"
         fi
 
-        # Firecracker and its socket run as root. Kill the VMM without its
-        # graceful cleanup so `coop stop` must recognize the abandoned
-        # root-owned socket and still remove the TAP.
+        # Firecracker runs without an API socket. Its base vsock socket is
+        # mode 0666 so coop can connect through the user-owned mode-0700
+        # instance directory. Kill the VMM without graceful cleanup so
+        # `coop stop` must recognize and remove the abandoned socket.
         fc_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        instance_dir="$HOME/.coop/instances/$INSTANCE"
         socket_path="$HOME/.coop/instances/$INSTANCE/firecracker.socket"
-        socket_metadata=$(stat -c '%U:%a' "$socket_path" 2>/dev/null || true)
-        if [[ -n "$fc_pid" && -S "$socket_path" \
-            && "$socket_metadata" == "root:755" ]]; then
+        vsock_path="$HOME/.coop/instances/$INSTANCE/vsock.sock"
+        directory_metadata=$(stat -c '%U:%a' "$instance_dir" 2>/dev/null || true)
+        vsock_metadata=$(stat -c '%U:%a' "$vsock_path" 2>/dev/null || true)
+        if [[ -n "$fc_pid" && ! -e "$socket_path" && -S "$vsock_path" \
+            && "$directory_metadata" == "$(id -un):700" \
+            && "$vsock_metadata" == "root:666" ]]; then
+            pass "Firecracker has no API socket and contains vsock in the private instance directory"
             if sudo -n kill -9 "$fc_pid"; then
                 for _ in {1..50}; do
                     if ! sudo -n kill -0 "$fc_pid" 2>/dev/null; then
@@ -2818,18 +2869,18 @@ test_stop() {
                     fi
                     sleep 0.1
                 done
-                if [[ "$exited" -eq 1 && -S "$socket_path" ]]; then
-                    pass "unexpected Firecracker exit leaves a root-owned API socket"
+                if [[ "$exited" -eq 1 && -S "$vsock_path" ]]; then
+                    pass "unexpected Firecracker exit leaves a root-owned vsock socket"
                 else
-                    fail "unexpected Firecracker exit leaves a root-owned API socket" \
-                        "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$socket_path" ]] && echo yes || echo no )"
+                    fail "unexpected Firecracker exit leaves a root-owned vsock socket" \
+                        "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$vsock_path" ]] && echo yes || echo no )"
                 fi
             else
                 fail "simulate unexpected Firecracker exit" "could not kill PID $fc_pid"
             fi
         else
-            fail "Firecracker stop fixture has a root-owned mode-0755 socket" \
-                "pid=${fc_pid:-<missing>} socket=$socket_path metadata=${socket_metadata:-missing}"
+            fail "Firecracker stop fixture has no API and a private mode-0666 vsock socket" \
+                "pid=${fc_pid:-<missing>} dir=${directory_metadata:-missing} api=$( [[ -e "$socket_path" ]] && echo present || echo absent ) vsock=${vsock_metadata:-missing}"
         fi
     fi
 
@@ -2848,6 +2899,12 @@ test_stop() {
             fail "stop removes stale Firecracker PID file" "PID file still exists"
         else
             pass "stop removes stale Firecracker PID file"
+        fi
+        if [[ -e "$socket_path" || -e "$vsock_path" ]]; then
+            fail "stop removes stale Firecracker runtime sockets" \
+                "api=$( [[ -e "$socket_path" ]] && echo present || echo absent ) vsock=$( [[ -e "$vsock_path" ]] && echo present || echo absent )"
+        else
+            pass "stop removes stale Firecracker runtime sockets"
         fi
     fi
 }
@@ -7827,6 +7884,7 @@ EOF
     test_running_vm_completions
     test_auto_resolve_running
     test_shell_connectivity
+    test_firecracker_vsock_transport
     test_ssh_alias
     test_ssh_config
     test_editor

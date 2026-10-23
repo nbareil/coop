@@ -123,7 +123,7 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 
 1. **Firecracker binary**: Downloaded from the latest GitHub release and stored in the data directory. The jailer binary is extracted alongside it.
 2. **Guest kernel**: Fetched from Firecracker's CI S3 bucket. This is a minimal `vmlinux` image matching the Firecracker release version.
-3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, Grok Build, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd.
+3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, Grok Build, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd plus a socket-activated AF_VSOCK listener that forwards to loopback SSH. Firecracker lifecycle traffic remains TCP-based.
 
 All three steps are idempotent. If the artifact already exists and is up to date, setup skips it.
 
@@ -136,7 +136,7 @@ Creating an instance (`coop up`) follows this sequence:
 3. Optionally resizes the rootfs if a larger disk was requested (truncate + e2fsck + resize2fs).
 4. Writes a Firecracker JSON config specifying the kernel, rootfs drive, vCPU/memory allocation, network interface, and vsock device.
 5. Creates and attaches a TAP device to the bridge (see TAP networking below).
-6. Starts the Firecracker process with `sudo`. Firecracker requires root for KVM and TAP access.
+6. Starts the Firecracker process with `sudo` and `--no-api`. Firecracker requires root for KVM and TAP access; coop does not expose its control API socket.
 7. Records the Firecracker PID and waits for SSH to become reachable.
 8. If `--mount` was specified, rsyncs the host directory into the guest. This
    is a one-time copy, not a live mount. Use `coop push` to update the guest;

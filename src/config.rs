@@ -3025,7 +3025,7 @@ impl Instance {
     }
 
     /// Probe Firecracker liveness without treating an uncertain probe
-    /// or an orphaned API socket as a confirmed exit.
+    /// or an orphaned Firecracker socket as a confirmed exit.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn probe_liveness(&self) -> Result<bool> {
         let pid_path = self.pid_file_path();
@@ -3068,7 +3068,22 @@ impl Instance {
             }
         }
 
-        ensure_firecracker_api_socket_stopped(&self.api_socket_path())?;
+        // Older stopped VMs leave an API socket entry behind. Probe it with
+        // privilege before treating it as stale; a live or uncertain socket
+        // must never be unlinked during startup or cleanup.
+        ensure_firecracker_socket_stopped(&self.api_socket_path(), "legacy API").with_context(
+            || {
+                let path = self.api_socket_path();
+                let quoted = crate::shell::shell_escape(&path.display().to_string());
+                format!(
+                    "Cannot verify legacy Firecracker API socket at {} is stopped. \
+                     Inspect it with `sudo lsof -nP {quoted}`. Verify and stop any process holding \
+                     it before retrying",
+                    path.display()
+                )
+            },
+        )?;
+        ensure_firecracker_socket_stopped(&self.vsock_path(), "base vsock")?;
         if pid.is_some()
             && let Err(error) = fs::remove_file(&pid_path)
             && error.kind() != std::io::ErrorKind::NotFound
@@ -3082,19 +3097,21 @@ impl Instance {
     }
 }
 
-/// Confirm that the root-owned Firecracker API socket is no longer accepting
-/// connections. An unprivileged connect sees `EACCES` for both live and stale
-/// mode-0755 sockets, so it cannot safely distinguish those states.
+/// Confirm that a root-owned Firecracker socket is no longer accepting
+/// connections. The privileged probe avoids permission denial masking a live
+/// root-owned socket.
 #[cfg(not(target_os = "macos"))]
-fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
+fn ensure_firecracker_socket_stopped(socket_path: &Path, kind: &str) -> Result<()> {
     match fs::symlink_metadata(socket_path) {
         Ok(metadata) if metadata.file_type().is_socket() => {}
         Ok(_) => bail!(
-            "Firecracker API socket path is not a Unix socket: {}",
+            "Firecracker {kind} socket path is not a Unix socket: {}",
             socket_path.display()
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("Failed to inspect Firecracker API socket"),
+        Err(error) => {
+            return Err(error).context(format!("Failed to inspect Firecracker {kind} socket"));
+        }
     }
 
     let output = Cmd::new(crate::privileged_disk::running_executable_path())
@@ -3102,10 +3119,10 @@ fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
         .arg(socket_path)
         .sudo()
         .output()
-        .context("Failed to run privileged Firecracker API socket probe")?;
+        .with_context(|| format!("Failed to run privileged Firecracker {kind} socket probe"))?;
     if !output.status.success() {
         bail!(
-            "Privileged Firecracker API socket probe failed ({}): {}",
+            "Privileged Firecracker {kind} socket probe failed ({}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -3115,12 +3132,12 @@ fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
 
 /// Run in the privileged helper so permission denial cannot mask a listener.
 #[cfg(target_os = "linux")]
-pub(crate) fn probe_firecracker_api_socket(socket_path: &Path) -> Result<()> {
-    classify_firecracker_socket_probe(connect_firecracker_api_socket(socket_path))
+pub(crate) fn probe_firecracker_socket(socket_path: &Path) -> Result<()> {
+    classify_firecracker_socket_probe(connect_firecracker_socket(socket_path))
 }
 
 #[cfg(target_os = "linux")]
-fn connect_firecracker_api_socket(socket_path: &Path) -> std::io::Result<()> {
+fn connect_firecracker_socket(socket_path: &Path) -> std::io::Result<()> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -3132,7 +3149,7 @@ fn connect_firecracker_api_socket(socket_path: &Path) -> std::io::Result<()> {
     if path.as_bytes_with_nul().len() > address.sun_path.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Firecracker API socket path is too long",
+            "Firecracker socket path is too long",
         ));
     }
     // SAFETY: the checked destination holds the entire NUL-terminated path.
@@ -3179,7 +3196,7 @@ fn connect_firecracker_api_socket(socket_path: &Path) -> std::io::Result<()> {
 #[cfg(any(target_os = "linux", test))]
 fn classify_firecracker_socket_probe(connection: std::io::Result<()>) -> Result<()> {
     match connection {
-        Ok(()) => bail!("Firecracker API socket is accepting connections without a valid PID"),
+        Ok(()) => bail!("Firecracker socket is accepting connections without a valid PID"),
         Err(error)
             if matches!(
                 error.raw_os_error(),
@@ -3188,7 +3205,7 @@ fn classify_firecracker_socket_probe(connection: std::io::Result<()>) -> Result<
         {
             Ok(())
         }
-        Err(error) => Err(error).context("Firecracker API socket liveness is uncertain"),
+        Err(error) => Err(error).context("Firecracker socket liveness is uncertain"),
     }
 }
 
@@ -3602,8 +3619,11 @@ mod tests {
     fn firecracker_socket_probe_rejects_live_socket() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
-        let _listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
-        assert!(probe_firecracker_api_socket(&inst.api_socket_path()).is_err());
+        for socket_path in [inst.api_socket_path(), inst.vsock_path()] {
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+            assert!(probe_firecracker_socket(&socket_path).is_err());
+            drop(listener);
+        }
     }
 
     #[test]
@@ -3628,12 +3648,24 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn probe_liveness_rejects_non_socket_api_path() {
+    fn probe_liveness_rejects_dangling_api_symlink() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
-        fs::write(inst.api_socket_path(), "not a socket").unwrap();
+        std::os::unix::fs::symlink("missing", inst.api_socket_path()).unwrap();
 
         assert!(inst.probe_liveness().is_err());
+        assert!(fs::symlink_metadata(inst.api_socket_path()).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_non_socket_vsock_path() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.vsock_path(), "not a socket").unwrap();
+
+        let error = inst.probe_liveness().unwrap_err();
+        assert!(format!("{error:#}").contains("base vsock socket path is not a Unix socket"));
     }
 
     #[test]
@@ -3663,6 +3695,7 @@ mod tests {
         let mut child = spawn_firecracker_like();
         wait_for_firecracker_cmdline(child.id());
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+        let _api = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
 
         let result = inst.probe_liveness();
         let _ = child.kill();
