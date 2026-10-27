@@ -50,15 +50,15 @@ user launched it.
 ## Taint sources (treat as untrusted)
 
 - **Guest filesystem content pulled to the host.** `workspace.rs` `pull` /
-  `tar_pipe_pull` / `rsync_pull` bring guest-authored file contents, filenames,
+  `rsync_pull` bring guest-authored file contents, filenames,
   and symlinks onto the host filesystem. This is the **widest guest→host
   channel** and the primary place a path-traversal or symlink escape could land.
   Files retain their untrusted origin after transfer, including when a host tool
   discovers them implicitly or consumes them during a later operation.
   Pull never invokes host Git to inspect its destination. It refuses a nonempty
   destination unless the user supplies `--force`, which authorizes overwriting
-  matching files but does not change their trust level. The transports attempt
-  to omit common ASCII-case `.git` paths, and both pull transports write into
+  matching files but does not change their trust level. Pull attempts
+  to omit common ASCII-case `.git` paths, and pull writes into
   an empty staging directory before a trusted host-side filtered installation.
   The staging boundary is a host-owned `0700` outer directory under private
   coop storage; transfer tools write only into its child. Pulls sharing a coop
@@ -238,12 +238,28 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   Codex via the `coop_local` provider's bearer `env_key`). In proxy mode Codex's
   `~/.codex/auth.json` is also **not** staged onto the guest disk (it holds a
   refreshable subscription token). Each credential is resolved on the host and
-  handed to `coop-proxy` over **stdin**, never argv or disk; a resolution failure
-  fails the boot closed. A per-VM override
+  handed to `coop-proxy` over **stdin**, never argv or a transport file. Literal
+  credentials are persisted in host configuration; `cmd:` indirections resolve
+  them at startup. A resolution failure fails the boot closed. A per-VM override
   (`proxy_state.rs`, `<inst.dir>/proxy.json`) selects a different host-side
   credential for one VM — resolution is override → default → off — without
   changing the proxy binary or the capability token. See
   [`credential-proxy.md`](credential-proxy.md).
+- **Codex access-token proxy auth stays on the host.** With `[proxy.openai]
+  auth = "codex_access_token"`, coop validates a Codex workspace PAT (`at-...`)
+  through a fixed, bounded HTTPS lookup at `auth.openai.com` before starting
+  the proxy. The token goes to curl and the proxy on stdin, never argv. Only
+  the workspace ID and FedRAMP routing flag are retained from the metadata
+  response; malformed metadata fails closed without echoing the response.
+  The proxy pins `chatgpt.com`, translates only the allowed Responses creation
+  operation to `/backend-api/codex/responses`, reconstructs the workspace and
+  FedRAMP headers from host-validated metadata, and strips guest-supplied
+  actor authorization. Both `OPENAI_API_KEY`
+  and `CODEX_ACCESS_TOKEN` are suppressed from managed guest forwarding in
+  OpenAI proxy mode. Cached OAuth tokens and legacy agent-identity JWTs are
+  unsupported; there is no refresh or API-key fallback. Token rotation takes
+  effect on VM restart. The guest's capability still authorizes inference
+  using the token creator's workspace entitlements; it is not a usage budget.
 - **Codex ChatGPT account auth is persistent guest state.** With
   `[codex] auth = "chatgpt"`, coop suppresses `OPENAI_API_KEY` across config,
   process env, `env_forward`, and persisted `--env` overlays, writes
@@ -270,11 +286,26 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 
 ## SSH boundary
 
+- Every coop-owned `ssh`, `scp`, and rsync-with-SSH launch resolves a validated
+  absolute executable from fixed system candidates or an exact
+  `[ssh.host_tools]` setting. The child environment is cleared and rebuilt with
+  `LANG=C` and `LC_ALL=C`, plus only generated `COOP_SSH_ENV_*` aliases or the
+  normalized interactive `TERM` value required by that invocation. Managed
+  clients run from `/` and pass `-F none`, so neither user nor system SSH
+  configuration contributes proxy commands, local commands, environment
+  forwarding, identities, agents, canonicalization, or forwards. Forwarding
+  is disabled unless the call site constructs a specific coop port or proxy
+  forward. The `ssh coop-<name>` alias written for an operator is not a
+  coop-owned process and remains subject to the operator's SSH configuration.
+- An exact host-tool setting authorizes only the validated filesystem identity:
+  coop does not attest its package provenance, hash, basename, or OpenSSH/rsync
+  semantics. Resolution is pathname-based and does not pin an executable
+  descriptor or its dynamic-loader closure.
 - coop connects to the guest with `StrictHostKeyChecking=no`,
   `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`,
   `ForwardAgent=no`, and `IdentityAgent=none`
-  (`backend.rs:SshTarget::transport_opts` — the one list `ssh`, `scp`, and
-  rsync's `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
+  (`openssh.rs:authority_options` — the one list `ssh`, `scp`, and rsync's
+  `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
   own transports add `BatchMode=yes`, so a rejected key fails instead of
   falling back to a password prompt; the `~/.ssh/config` block written for the
   user's own `ssh coop-<name>` deliberately does not. This is
@@ -284,6 +315,29 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   to a VM the host itself owns. Coop-owned transports disable host agent use
   and forwarding; generated SSH config blocks set the same options for aliases,
   subject to OpenSSH configuration precedence for the user-owned file.
+- The Firecracker-vsock transport renders `ProxyCommand` only from the running
+  coop executable, a trusted per-instance socket path, and a non-zero numeric
+  guest port. Paths reject OpenSSH expansion characters and control bytes,
+  escape `%` tokens, and are POSIX-shell quoted before OpenSSH interprets the
+  command. The helper accepts no command text from the guest: it sends one
+  bounded `CONNECT <port>` request, validates one bounded `OK <port>` response,
+  and then relays bytes. Firecracker starts with `--no-api`, so newly started
+  VMs have no API socket. Its process umask makes the base vsock socket mode
+  0666 inside the user-owned mode-0700 instance directory; other users cannot
+  reach it through the directory. This grants the invoking user access to the
+  guest transport, not a Firecracker control API. A process started before
+  `--no-api` may retain an API socket until stopped. Without a verified PID,
+  coop uses a privileged, nonblocking connection probe on the API and base
+  vsock socket entries. Only a refused or missing socket permits cleanup;
+  a live listener, non-socket entry, or uncertain result blocks it. Coop never
+  kills a process found through a socket lookup. Confirmed stale entries are
+  unlinked through the pinned private directory rather than a root shell command.
+- A Firecracker instance's control mode is persisted at creation. `vsock`
+  mode never silently retries TCP: readiness, shutdown, shell, file transfer,
+  forwarding, and generated SSH configuration all derive the same target from
+  that tag. Older untagged instances map to `legacy_tcp` for compatibility.
+  This is control-plane independence, not host network isolation: the guest
+  NIC, TAP, bridge, forwarding, NAT, and TCP SSH recovery listener remain.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it
@@ -365,8 +419,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   reachable by exactly one guest, identically on both backends. It is guarded
   by a per-instance capability token and forwards only its documented
   provider-specific operations to a fixed per-provider upstream
-  (`api.anthropic.com` / `api.openai.com`), never a guest-supplied host — one
-  proxy process and one tunnel per (VM, provider). Its own TLS-verifying
+  (`api.anthropic.com` / `api.openai.com` / `chatgpt.com`), never a
+  guest-supplied host — one proxy process and one tunnel per (VM, provider). Its own TLS-verifying
   outbound HTTPS is the intended egress; a change that lets the guest influence
   the upstream host, widens the operation policy without security review, or
   binds anything wider than loopback, is a finding. The proxy streams allowed
@@ -400,7 +454,7 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   flag a change that *widens* them):
   - **Port-scoped, not host-scoped.** Both Landlock and Seatbelt filter by
     port, not hostname/IP. A *fully compromised* proxy could still open a TCP
-    connection to some other host on `:443`; the two upstreams' identity is
+    connection to some other host on `:443`; the fixed upstreams' identity is
     enforced one layer up, at the proxy's TLS verification + pinned `Host`, and
     the guest still cannot retarget them. Host-scoped egress would need IP
     pinning (fragile against CDN rotation) or an L7 egress proxy — out of scope
@@ -431,9 +485,16 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 
 Self-update (`update.rs`) must preserve, in order:
 
-1. Metadata from the pinned `trailofbits/coop` GitHub repo (compile-time const).
-2. `normalize_tag` — the version tag is validated as semver **before** it enters
-   the API URL path (path-traversal guard).
+1. Metadata from the fixed
+   `https://api.github.com/repos/trailofbits/coop/releases` identity. Official
+   builds reject the retired runtime origin override before network I/O; the
+   background check applies the same policy.
+2. The requested or returned tag must be canonical `v`-prefixed semver. Before
+   an asset download, metadata entries for the platform archive, `SHA256SUMS`,
+   and optional `attestations.jsonl` are independently bound to the exact
+   `https://github.com/trailofbits/coop/releases/download/<tag>/<filename>`
+   identity. Userinfo, ports, queries, fragments, encoded separators, path
+   ambiguity, lookalike names, and conflicting duplicates are rejected.
 3. **Mandatory checksum.** The `SHA256SUMS` asset must be present (install is
    refused otherwise) and every downloaded tarball is verified against it
    (`verify_sha256`, constant-size `Sha256Hash` compare).
@@ -449,7 +510,7 @@ Self-update (`update.rs`) must preserve, in order:
    `--bundle` means **no attestations-API call and no credential** — `gh` marks
    the flag `DisableAuthCheckFlag`, so no token or `gh auth login` is needed.
    The bundle asset is fetched with a deliberately unauthenticated request
-   (`curl_download(url, dest, None)` in `update.rs`, `download_bundle` in
+   (`curl_download(asset, dest, None)` in `update.rs`, `download_bundle` in
    `install.sh`) rather than through `download_asset` / `gh release download`,
    which would re-attach the very credential this transport exists to avoid — a
    SAML-restricted token would then 403 on the fetch and drop the chain back to
@@ -494,19 +555,19 @@ Self-update (`update.rs`) must preserve, in order:
    API — that is no stricter on integrity, but a digest mismatch, a corrupt
    download and an unusable `gh` all surface here, and switching transports
    would mask them. Skipped with a logged note if `gh` is absent, and skipped
-   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode), unless
-   the updater integration suite sets `COOP_UPDATE_TEST_VERIFY_ATTESTATION=1`
-   to exercise verification against a local fixture. So
+   in the separately compiled test-source build unless the updater integration
+   suite sets `COOP_UPDATE_TEST_VERIFY_ATTESTATION=1` to exercise verification
+   against its loopback fixture. Official builds cannot construct that source. So
    provenance is *not* guaranteed on hosts without `gh` — checksum is the
    floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.
 
-`COOP_UPDATE_API_BASE_URL` redirects the update origin and normally disables
-attestation; the checksum then only proves integrity against *that* server's own
-`SHA256SUMS`, giving no provenance. Only the pinned `github.com` default +
-attestation provide provenance. Flag any change that widens where that override
-is honored, or that softens any step above.
+Production curl transfers restrict both initial and redirected protocols to
+HTTPS and retain curl's default refusal to forward authorization headers across
+hosts. `install.sh` remains a separate update path with its own policy. Flag any
+change that makes a production update source runtime-selectable or softens any
+step above.
 
 ## Documented, accepted trade-offs
 

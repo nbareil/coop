@@ -125,6 +125,13 @@ Lifecycle and guest-visible changes still require both real backends:
 
 ## Integration tests
 
+Generated completion is checked without a VM by
+`cargo test --test shell_completion --test zsh_completion`.
+CI runs the generated Bash and zsh
+scripts, including zsh's first Tab after `$fpath` autoloading. All five shells
+have generation and dynamic-protocol checks; fish, elvish, and PowerShell
+interpreters are not required or installed for these checks.
+
 VM integration uses two scripts:
 
 - `tests/integration.sh` — the test suite. Runs locally, requires `--binary`.
@@ -208,6 +215,13 @@ Linux CI runs them. The full VM suite additionally checks these probes against
 real guests. A host FORWARD policy other than ACCEPT still causes an explicit
 skip of the routed guest-isolation probe, since it would mask the coop rule.
 
+Run `tests/integration-update.sh` for the host-only self-updater flow. The
+script compiles a distinct `COOP_FORCE_BUILD_KIND=test` binary and supplies its
+loopback fixture through `COOP_UPDATE_TEST_API_BASE_URL`; only that build kind
+can construct the fixture source. Normal release builds reject the retired
+`COOP_UPDATE_API_BASE_URL` control before network I/O. The fixture also covers
+checksum and attestation failures without changing an installed coop binary.
+
 Run `python3 tests/test-codex-account.py` for the account wrapper's argument,
 login/logout, API-key passthrough, and `codex-yolo` regressions (also in Linux
 CI). To additionally test implicit daemon reuse with a real Linux Codex binary:
@@ -269,9 +283,10 @@ loopback port and requires startup to return an error without publishing a PID
 or leaving the SSH master alive. Separate host and guest network namespaces
 allow the destination and reverse listener to use the same port.
 
-The runner requires Rust/Cargo, Python 3, passwordless sudo, iproute2,
+The runner requires Python 3, passwordless sudo, iproute2,
 util-linux, coreutils, hostname, and OpenSSH client/server tools. It builds
-unprivileged, then confines the fixture to disposable mount, network, UTS, and
+the test binary with Cargo unless `COOP_TEST_PREBUILT_BINARY` names one, then
+confines the fixture to disposable mount, network, UTS, and
 PID namespaces. No user SSH configuration or keys are used. Namespace teardown
 removes all children and temporary files on success, failure, or timeout.
 Linux CI and release preflight run this gate explicitly; ordinary unit tests
@@ -281,8 +296,9 @@ not replace the Firecracker and Lima VM integration gates.
 The same fixture exercises guest environment forwarding through real OpenSSH:
 literal values, empty values, transport-name collisions, PTYs, stdin, exit
 status, missing forwarding, and redacted assignment failures. Its sshd accepts
-only `COOP_SSH_ENV_*`, so original guest names cannot satisfy the test by
-bypassing the transport. The ordinary unit suite separately checks host
+`COOP_SSH_ENV_*` plus a dedicated unrelated canary used to prove that hostile
+`SendEnv`, `SetEnv`, and forwarding policy remains inactive. Original guest
+names therefore cannot satisfy the test by bypassing alias restoration. The ordinary unit suite separately checks host
 environment isolation on all four SSH launch paths and saved CLI guest environment values through a later session.
 
 The forwarding code in `backend.rs` and `ssh.rs` is outside cargo-mutants'
@@ -347,6 +363,9 @@ both assertions work. Apply the execution restrictions above.
 Unit tests cover private creation under permissive and restrictive umasks, atomic replacement,
 legacy state repair, concurrent instance removal, unsafe links and parents,
 Firecracker config creation/replacement, and Linux POSIX ACL removal.
+Trusted-path fixtures create their directories with explicit private modes. On
+Linux, check them under a group-writable umask with
+`(umask 0002; cargo test --workspace)`.
 The umask fixtures run in child processes to avoid changing other tests' umask. Two Linux unit probes require passwordless sudo:
 
 ```bash
@@ -356,13 +375,17 @@ cargo test --lib unmount_rejects_name_swapped_to_outside_mount -- --ignored
 
 The VM integration suite checks host directory, JSON state, template disk, and
 instance disk modes after creation and after commit/restore on both backends.
+On Firecracker it also extends a stopped instance's image without growing ext4,
+retries `coop resize` at that same absolute size, and checks ext4 capacity.
 
 On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
 run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
 the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
 It also corrupts an ext4 inode reference count, checks that read-only verification
-rejects it, and repairs the filesystem before resizing. The repair operation
+rejects it, then retries `coop resize` at the already extended image size and
+checks the filesystem's block capacity. It also checks a completed no-op retry
+and rejects a shrink hidden by whole-GiB rounding. The repair operation
 accepts exit code 1 (errors corrected), as defined by
 [e2fsprogs 1.47.0](https://github.com/tytso/e2fsprogs/blob/v1.47.0/e2fsck/e2fsck.8.in).
 Nonzero results from other disk tools, reboot-required results, error combinations,
@@ -426,6 +449,8 @@ parsing, or state composition:
 - `src/github_repo.rs`, `src/github_pat.rs`, `src/secret_store.rs` — slug
   parsing and secret routing
 - `src/fs_util.rs` — path manipulation helpers
+- `src/update_policy.rs` — updater source, tag, and release-asset identity
+  policy (the shell-out orchestration remains in excluded `src/update.rs`)
 - `src/commands/` — pure input-compatibility guards, summary/message builders,
   byte-to-GiB arithmetic kernels, and predicates such as
   `is_sensitive_workspace`
@@ -467,8 +492,10 @@ The same split applies in `src/commands/`. Kept helpers include
 `up_has_restart_only_inputs`, `restart_has_ignored_creation_flags`,
 `find_workspace_instance`, `find_git_repo_instance`,
 `no_stopped_instance_message`, `creation_options_rejected_message`, profile
-summary builders, `bytes_to_gib`, `format_dir_size`, `project_dir_to_str`, and
-`is_sensitive_workspace`. Their backend-driving wrappers remain excluded.
+summary builders, `reprovision_regrow_target`, `format_dir_size`,
+`project_dir_to_str`, and `is_sensitive_workspace`. Their backend-driving
+wrappers remain excluded. `GiB::from_bytes_ceil` is the shared byte-to-GiB
+conversion kernel in `config.rs`.
 
 The `coop model` feature follows the same split. `tools_needing_prompt`,
 `switch_report_lines`, `ModelState` resolution/default logic, and

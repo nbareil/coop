@@ -2,6 +2,70 @@
 
 ## Unreleased
 
+## v0.9.1
+
+### Fixed
+
+- Keep Lima VM starts headless, including restarts of existing instances whose
+  persisted configuration enables a graphical display.
+
+## v0.9.0
+
+### Security
+
+- Warn before launching a host-side remote editor against a VM. A compromised
+  guest can use the editor's remote integration to execute commands on the
+  host, so only trusted guests should be opened this way.
+
+### New features
+
+- Add credential-proxy support for Codex workspace personal access tokens.
+  `proxy.openai.auth = "codex_access_token"` validates the token on the host,
+  keeps it out of the guest, and routes inference through the ChatGPT Codex
+  backend with the workspace identity and controls returned by validation.
+- Generate dynamic completion scripts for Bash, zsh, Fish, PowerShell, and
+  Elvish. Completions now include live instance, image, and profile names.
+
+### Changed
+
+- Use rsync for every workspace transfer and remove the tar fallback. The host
+  and guest must both provide rsync; coop images include it by default. Hard
+  links are copied as independent files.
+
+### Fixed
+
+- Load generated Bash completions portably on macOS's system Bash 3.2.
+
+## v0.8.1
+
+### Security
+
+- Resolve coop-managed Linux network tools and OpenSSH clients through trusted
+  absolute paths, and launch them with an isolated environment and working
+  directory. Optional paths for nonstandard installations are validated for
+  ownership, permissions, symlink safety, and executable type before use.
+- Bind updater archives, checksums, and attestation bundles to the official
+  `trailofbits/coop` repository, canonical tags, and exact release asset URLs.
+  Reject ambiguous asset metadata and runtime source overrides, and restrict
+  download protocols across redirects.
+- Harden Lima template serialization so adversarial provision scripts, image
+  locations, and mount paths remain inert YAML scalar values. Replace the
+  deprecated `serde_yaml` dependency with `serde-saphyr`.
+
+### Changed
+
+- Store new 1Password GitHub PATs and proxy credentials as API Credential items
+  instead of Login items. Existing Login retrieval commands remain supported;
+  rotating a token or rerunning proxy setup creates an API Credential replacement
+  with a concealed `password` compatibility field, so the previous lookup still
+  works if saving the new retrieval command fails.
+
+### Fixed
+
+- Resume Firecracker filesystem growth after an interrupted setup when the disk
+  image has already reached the requested byte size but the filesystem still
+  needs repair or expansion.
+
 ## v0.8.0
 
 ### Security

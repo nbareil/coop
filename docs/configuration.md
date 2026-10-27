@@ -13,7 +13,7 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `data_dir` | string (path) | `~/.coop` | Directory for VM artifacts: images, instances, keys, kernel, Firecracker binary. |
-| `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
+| `ssh_port` | integer | `22` | SSH port for the legacy Firecracker TCP transport. Must be > 0. The opt-in vsock listener proxies fixed guest port 22; Lima uses its dynamically assigned host port. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
 | `guest_files` | array of tables | empty | Explicit files or directories copied before agent bootstrap on every boot. See [Guest files](#guest-files). |
@@ -231,8 +231,15 @@ token = "cmd:vault read -field=token secret/coop/github/trailofbits-coop"
 
 # 1Password (matches what the wizard emits)
 [github.pat."trailofbits/coop-plugins"]
-token = "cmd:op item get 'coop-github-pat (trailofbits-coop-plugins)' --fields password --reveal"
+token = "cmd:op item get 'coop-github-pat (trailofbits-coop-plugins)' --fields credential --reveal"
 ```
+
+The 1Password wizard creates **API Credential** items and stores the token in
+the `credential` field. Existing **Login** items with `--fields password`
+retrieval commands remain supported. Rotating a token creates an API Credential
+replacement and updates its saved retrieval command. The replacement also keeps
+a concealed `password` field so the previous lookup still works if saving the
+new retrieval command fails.
 
 Other subcommands:
 
@@ -312,8 +319,28 @@ skip = ["trailofbits/big-repo"]
 
 VM resource allocation and boot configuration.
 
+### Size units
+
+Storage uses binary GiB (1 GiB = 1,073,741,824 bytes); memory uses binary
+MiB (1 MiB = 1,048,576 bytes). Config fields with `_gib` or `_mib` are bare
+positive integers in those units. CLI size flags accept bare integers or the
+matching `GiB`/`MiB` suffix; disk flags also accept legacy `G` and `g`, both
+meaning **GiB**. Decimal `GB`/`MB`, ambiguous `M`, fractions, and a unit from
+the other field are rejected. For example, `--disk 12GiB`, `--mem 4096MiB`,
+and `resize --size +2G` are valid; `--disk 12GB` is not.
+
+Absolute disk targets are exact whole GiB. Shrink checks compare exact image
+byte lengths, including any extra bytes beyond a GiB boundary. Relative resize
+rounds the current image length **up** to the next GiB before adding the
+requested increment. Reprovision preserves at least the previous byte length
+by rounding its target up; a nonaligned disk can therefore gain less than 1
+GiB. Lima rounds the base image length up when choosing a new instance's
+whole GiB disk size. Human image sizes are approximate display values; JSON
+`size_bytes` and resource fields ending in `_mib` keep their raw, named units.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `firecracker_control` | string | `legacy_tcp` | Control transport recorded for newly created Linux/Firecracker instances: `legacy_tcp` or opt-in `vsock`. Existing instances keep their persisted mode; older state without the field loads as `legacy_tcp` without being rewritten. A vsock instance requires image metadata from a current `coop setup`; incompatible images are rejected with rebuild guidance before instance allocation or restore. Ignored by Lima, which remains TCP-based. |
 | `vcpu_count` | integer | `2` | Number of vCPUs for **new** instances. Must be > 0. Overridable with `--vcpus` on `setup` and `up`. Change an existing instance with `coop resize --vcpus`. |
 | `mem_size_mib` | integer | `4096` | Memory in MiB for **new** instances. Must be >= 128. Overridable with `--mem` on `setup` and `up`. Change an existing instance with `coop resize --mem`. |
 | `template_size_gib` | integer | `8` | Template rootfs disk size in GiB. Must be > 0. Overridable with `--template-size` on `setup`. |
@@ -362,6 +389,34 @@ Tool paths are re-resolved from the current config on setup and cleanup. If the
 config changes or a selected path disappears, cleanup for that tool category
 cannot run until the configuration is corrected. The table is parsed but has
 no effect on the Lima backend.
+
+## `ssh` section
+
+Coop-owned guest transports use fixed absolute system candidates for `ssh`,
+`scp`, and `rsync`. They do not inherit user or system SSH configuration, host
+shell environment, or the caller's working directory. This applies only to
+processes launched by coop; the generated `ssh coop-<name>` operator alias uses
+the operator's normal SSH client configuration.
+
+Non-FHS and alternate installations can select exact executables:
+
+```toml
+[ssh.host_tools]
+ssh = "/run/current-system/sw/bin/ssh"
+scp = "/run/current-system/sw/bin/scp"
+rsync = "/run/current-system/sw/bin/rsync"
+```
+
+Each field is optional. A configured field replaces the built-in candidates
+and never falls back. Every path component and the executable must be owned by
+root or the invoking user and must not be group/other writable; the target must
+be a regular executable. These checks authorize a filesystem identity only,
+not package provenance or implementation semantics.
+
+Rsync passes its SSH executable and options through rsync's `-e` command
+grammar. Coop quotes words with rsync's own quote rules, including paths with
+spaces or shell metacharacters. Non-UTF-8 paths and control characters cannot
+be represented unambiguously and are rejected for rsync-backed workspaces.
 
 ## Guest user
 
@@ -536,9 +591,10 @@ Every golden image installs the Secret Service packages this mode needs
 gating them would let a later `auth = "chatgpt"` edit meet an image that cannot
 serve it.
 
-`[proxy.openai]` is API-key based and cannot be combined with
+`[proxy.openai]` accepts an OpenAI API key or a Codex workspace personal access
+token and cannot be combined with
 `[codex] auth = "chatgpt"`. Use one Codex remote auth path per VM: the proxy
-for an OpenAI API key, or ChatGPT auth for account/workspace access.
+for a host-held credential, or ChatGPT auth for login inside the guest.
 
 Proxy mode applies only in remote model mode
 ([`coop model <vm> remote`](commands.md#model)); local mode takes precedence.
@@ -550,8 +606,8 @@ Both blocks take the same fields:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `credential` | string | required | The real credential — an API key or a Claude `setup-token`. A plain value or a `cmd:` invocation resolved at proxy start. Never written to disk and never forwarded into the guest. |
-| `auth` | `api_key` \| `bearer` | `api_key` | How the proxy injects the credential upstream. `api_key` sends `x-api-key: <credential>` (the Anthropic API-key form); `bearer` sends `Authorization: Bearer <credential>`, used for a Claude `setup-token`. OpenAI keys are always Bearer. |
+| `credential` | string | required | An API key, Claude `setup-token`, or Codex personal access token. A plain value or a `cmd:` invocation resolved at proxy start. Resolved secrets are held in memory and never forwarded into the guest. |
+| `auth` | `api_key` \| `bearer` \| `codex_access_token` | `api_key` | `api_key` sends `x-api-key`; `bearer` sends `Authorization: Bearer` for API keys or Claude setup tokens. OpenAI-only `codex_access_token` validates a workspace PAT (`at-...`) on the host and routes inference to the ChatGPT Codex backend using workspace entitlements. |
 
 ```toml
 [proxy.anthropic]

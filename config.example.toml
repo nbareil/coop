@@ -4,7 +4,7 @@
 # Run `coop validate` to check your config.
 
 # data_dir = "~/.coop"          # VM artifacts: images, instances, keys
-# ssh_port = 22                 # Guest SSH port
+# ssh_port = 22                 # Legacy TCP guest SSH port (vsock proxies fixed port 22)
 # firecracker_bin = "~/.coop/firecracker"  # Linux only
 # post_create = "sudo apt-get update && sudo apt-get install -y htop"
 # Creation commands run once per VM creation, after workspace setup.
@@ -43,6 +43,7 @@
 # prompt_for_pat = true           # auto-prompt to set up a PAT at `coop start`
 
 # [vm]
+# firecracker_control = "legacy_tcp" # Linux only: "legacy_tcp" or opt-in "vsock" for new instances
 # vcpu_count = 2                # vCPUs per VM (override: --vcpus)
 # mem_size_mib = 4096           # Memory in MiB (override: --mem)
 # template_size_gib = 8         # Template disk in GiB (override: --template-size)
@@ -63,6 +64,15 @@
 # bridge = "/run/current-system/sw/bin/bridge"
 # iptables = "/run/current-system/sw/bin/iptables"
 # sysctl = "/run/current-system/sw/bin/sysctl"
+
+# Coop-managed SSH/SCP/rsync processes ignore user and system SSH config and
+# use a cleared environment. Conventional Linux and macOS hosts need no
+# overrides. Set exact paths only for non-FHS or alternate installations; a
+# set field replaces built-in candidates and never falls back.
+# [ssh.host_tools]
+# ssh = "/run/current-system/sw/bin/ssh"
+# scp = "/run/current-system/sw/bin/scp"
+# rsync = "/run/current-system/sw/bin/rsync"
 
 # [guest_env]                   # Literal env vars to set in the guest.
 #                               # Overrides forwarded values on key
@@ -186,9 +196,13 @@
 # [proxy.openai]                    # Codex. OpenAI keys are always Bearer.
 # credential = "cmd:op read op://Private/OpenAI/credential"
 # auth = "bearer"                   # OpenAI keys inject as Authorization: Bearer.
+#                                   # For subscription/workspace Codex usage:
+#                                   # `coop proxy setup --openai --codex-access-token`
+#                                   # stores a Codex-scoped PAT (at-...). Set
+#                                   # auth = "codex_access_token" for that mode.
 #                                   # Cannot be combined with
-#                                   # [codex] auth = "chatgpt"; proxy mode uses
-#                                   # an API key.
+#                                   # [codex] auth = "chatgpt"; proxy mode holds
+#                                   # its credential on the host.
 
 # [profiles.my-tools]
 # apt_packages = ["ripgrep", "fd-find", "jq"]

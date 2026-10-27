@@ -11,6 +11,22 @@ use crate::cmd::Cmd;
 
 const MAX_SYMLINKS: usize = 40;
 
+/// Create executable test fixtures below the invoking user's private home.
+///
+/// Linux's global temporary directory is intentionally group/other-writable,
+/// so it cannot host fixtures that exercise the production trusted-path
+/// policy. Tests using exact host-tool paths must use this helper.
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test fixture setup must succeed")]
+pub(crate) fn trusted_test_tempdir() -> tempfile::TempDir {
+    let home = dirs::home_dir().expect("test user has a home directory");
+    tempfile::Builder::new()
+        .prefix(".coop-trusted-tool-test-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(home)
+        .expect("create trusted host-tool fixture")
+}
+
 /// Policy for one family of trusted host executables.
 ///
 /// `trust_anchor` is the highest directory whose ownership this policy proves.
@@ -18,7 +34,7 @@ const MAX_SYMLINKS: usize = 40;
 pub(crate) struct TrustedToolPolicy {
     trust_anchor: PathBuf,
     allowed_roots: Vec<PathBuf>,
-    expected_uid: u32,
+    trusted_uids: Vec<u32>,
 }
 
 impl TrustedToolPolicy {
@@ -37,7 +53,26 @@ impl TrustedToolPolicy {
         Self {
             trust_anchor: trust_anchor.into(),
             allowed_roots: allowed_roots.into_iter().collect(),
-            expected_uid,
+            trusted_uids: vec![expected_uid],
+        }
+    }
+
+    /// Construct a policy whose path may be controlled by one of several
+    /// explicitly trusted host identities. This is used by unprivileged host
+    /// tools on platforms where a system executable or an operator-owned
+    /// package-manager executable are both supported.
+    pub(crate) fn new_with_owners(
+        trust_anchor: impl Into<PathBuf>,
+        allowed_roots: impl IntoIterator<Item = PathBuf>,
+        trusted_uids: impl IntoIterator<Item = u32>,
+    ) -> Self {
+        let mut trusted_uids = trusted_uids.into_iter().collect::<Vec<_>>();
+        trusted_uids.sort_unstable();
+        trusted_uids.dedup();
+        Self {
+            trust_anchor: trust_anchor.into(),
+            allowed_roots: allowed_roots.into_iter().collect(),
+            trusted_uids,
         }
     }
 }
@@ -74,10 +109,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::test_support::private_tempdir().unwrap();
             let anchor = temp.path().join("root");
             let bin = anchor.join("usr/bin");
-            fs::create_dir_all(&bin).unwrap();
+            crate::test_support::create_private_dir_all(&bin).unwrap();
             let uid = fs::metadata(&anchor).unwrap().uid();
             let policy = TrustedToolPolicy::new(&anchor, [bin.clone()], uid);
             Self {
@@ -150,11 +185,11 @@ mod tests {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let anchor = temp.path().join("root");
-        fs::create_dir_all(anchor.join("usr/bin")).unwrap();
+        crate::test_support::create_private_dir_all(anchor.join("usr/bin")).unwrap();
         let hostile = temp.path().join("hostile");
-        fs::create_dir(&hostile).unwrap();
+        crate::test_support::create_private_dir_all(&hostile).unwrap();
         let marker = temp.path().join("executed");
         let hostile_ip = hostile.join("ip");
         fs::write(
@@ -210,7 +245,7 @@ mod tests {
         assert!(non_executable.to_string().contains("not executable"));
 
         let directory = fixture.bin.join("directory");
-        fs::create_dir(&directory).unwrap();
+        crate::test_support::create_private_dir_all(&directory).unwrap();
         let non_regular =
             resolve_host_tool(TestTool::Ip, &[directory], &fixture.policy).unwrap_err();
         assert!(non_regular.to_string().contains("not a regular file"));
@@ -220,7 +255,7 @@ mod tests {
     fn accepts_merged_usr_symlink_when_every_hop_is_trusted() {
         let fixture = Fixture::new();
         let sbin_target = fixture.anchor.join("usr/sbin");
-        fs::create_dir_all(&sbin_target).unwrap();
+        crate::test_support::create_private_dir_all(&sbin_target).unwrap();
         let target = sbin_target.join("ip");
         fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
@@ -247,7 +282,7 @@ mod tests {
 
         let target = fixture.executable("real-ip", "#!/bin/sh\nexit 0\n");
         let writable = fixture.anchor.join("writable");
-        fs::create_dir(&writable).unwrap();
+        crate::test_support::create_private_dir_all(&writable).unwrap();
         fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
         let candidate = writable.join("ip");
         symlink(&target, &candidate).unwrap();
@@ -264,7 +299,7 @@ mod tests {
     fn explicit_path_accepts_a_trusted_target_outside_builtin_roots() {
         let fixture = Fixture::new();
         let store = fixture.anchor.join("nix/store/package/bin");
-        fs::create_dir_all(&store).unwrap();
+        crate::test_support::create_private_dir_all(&store).unwrap();
         let target = store.join("ip");
         fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
@@ -290,8 +325,8 @@ mod tests {
         let a = fixture.anchor.join("a");
         let outside = fixture.anchor.join("outside");
         let deep = outside.join("deep");
-        fs::create_dir_all(&a).unwrap();
-        fs::create_dir_all(&deep).unwrap();
+        crate::test_support::create_private_dir_all(&a).unwrap();
+        crate::test_support::create_private_dir_all(&deep).unwrap();
 
         // Lexically collapsing `link/..` would inspect a/tool. The kernel
         // follows link first, then applies `..`, and therefore executes
@@ -334,7 +369,7 @@ mod tests {
     fn rejects_unreadable_candidates_and_non_directory_allowed_roots() {
         let fixture = Fixture::new();
         let locked = fixture.anchor.join("locked");
-        fs::create_dir(&locked).unwrap();
+        crate::test_support::create_private_dir_all(&locked).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         let unreadable =
             resolve_host_tool(TestTool::Ip, &[locked.join("ip")], &fixture.policy).unwrap_err();
@@ -460,7 +495,6 @@ pub(crate) struct ResolvedHostTool<I> {
 }
 
 impl<I> ResolvedHostTool<I> {
-    #[cfg(test)]
     pub(crate) fn launch_path(&self) -> &Path {
         &self.launch_path
     }
@@ -630,7 +664,7 @@ fn validate_candidate(
     if metadata.permissions().mode() & 0o111 == 0 {
         return Err("canonical target is not executable".to_string());
     }
-    validate_owner_and_mode(&metadata, policy.expected_uid, "canonical target")?;
+    validate_owner_and_mode(&metadata, &policy.trusted_uids, "canonical target")?;
 
     if matches!(containment, TargetContainment::Explicit) {
         return Ok(canonical_target);
@@ -686,7 +720,7 @@ fn resolve_and_validate(
     if !anchor_metadata.is_dir() {
         return Err("trust anchor is not a directory".to_string());
     }
-    validate_owner_and_mode(&anchor_metadata, policy.expected_uid, "trust anchor")?;
+    validate_owner_and_mode(&anchor_metadata, &policy.trusted_uids, "trust anchor")?;
 
     let mut current = anchor.clone();
     let mut pending = normal_components(relative)?;
@@ -717,11 +751,11 @@ fn resolve_and_validate(
             if followed > MAX_SYMLINKS {
                 return Err(format!("more than {MAX_SYMLINKS} symbolic links"));
             }
-            if metadata.uid() != policy.expected_uid {
+            if !policy.trusted_uids.contains(&metadata.uid()) {
                 return Err(format!(
-                    "symbolic link has uid {}, expected {}",
+                    "symbolic link has uid {}, expected one of {:?}",
                     metadata.uid(),
-                    policy.expected_uid
+                    policy.trusted_uids
                 ));
             }
             let target = fs::read_link(&next)
@@ -748,7 +782,7 @@ fn resolve_and_validate(
             if !metadata.is_dir() {
                 return Err("non-directory path component".to_string());
             }
-            validate_owner_and_mode(&metadata, policy.expected_uid, "path directory")?;
+            validate_owner_and_mode(&metadata, &policy.trusted_uids, "path directory")?;
         }
         if pending.is_empty() {
             return Ok((current, metadata));
@@ -758,13 +792,13 @@ fn resolve_and_validate(
 
 fn validate_owner_and_mode(
     metadata: &Metadata,
-    expected_uid: u32,
+    trusted_uids: &[u32],
     what: &str,
 ) -> Result<(), String> {
-    if metadata.uid() != expected_uid {
+    if !trusted_uids.contains(&metadata.uid()) {
         return Err(format!(
-            "{what} has uid {}, expected {expected_uid}",
-            metadata.uid()
+            "{what} has uid {}, expected one of {trusted_uids:?}",
+            metadata.uid(),
         ));
     }
     let mode = metadata.permissions().mode();

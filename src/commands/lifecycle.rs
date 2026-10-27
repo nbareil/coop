@@ -715,11 +715,24 @@ pub(super) fn allocate_and_start(
     workspace_path: Option<&Path>,
     opts: &StartOpts<'_>,
 ) -> Result<config::Instance> {
+    {
+        let _image_lock = setup::lock_image_publication(cfg, image)?;
+        // Validate before persisting an instance: old Firecracker images do not
+        // necessarily contain the guest listener required by vsock control.
+        be.validate_image_control(cfg, image, cfg.vm.firecracker_control)?;
+    }
     let inst = cfg.allocate_instance(name, image, workspace_path)?;
     tracing::info!("Starting instance '{}' (index {})", inst.name, inst.index);
 
     let _guard = signal::install_handlers();
-    let result = start_instance(be, &mut *cfg, &inst, opts);
+    // Keep the global lock order consistent with reprovisioning: an instance's
+    // provisioning lock is always acquired before its image publication lock.
+    // Re-lock and revalidate the image immediately before the backend consumes
+    // it, since a commit could have replaced it after the pre-allocation check.
+    let result = (|| {
+        let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
+        start_instance(be, &mut *cfg, &inst, opts, Some(image))
+    })();
 
     if let Err(error) = &result
         && error.is::<crate::creation_hooks::CreationIncomplete>()
@@ -943,10 +956,9 @@ fn restart_instance(
     run_configured_post_start(cfg, inst, &target, repo.as_ref(), command.as_deref())?;
 
     tracing::info!(
-        "Instance '{}' restarted — SSH: {}:{}",
+        "Instance '{}' restarted — SSH: {}",
         inst.name,
-        target.host,
-        target.port,
+        target.connection_description(),
     );
     Ok(())
 }
@@ -987,6 +999,7 @@ fn start_instance(
     cfg: &mut config::CoopConfig,
     inst: &config::Instance,
     opts: &StartOpts<'_>,
+    image_to_consume: Option<&config::ImageName>,
 ) -> Result<()> {
     // Derive the GitHub repo slug as early as possible so the auto-prompt
     // can fire before any VM cost is incurred, and so pat-mode token
@@ -1002,10 +1015,16 @@ fn start_instance(
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
+    let image_lock = image_to_consume
+        .map(|image| setup::lock_image_publication(cfg, image))
+        .transpose()?;
+    if let Some(image) = image_to_consume {
+        be.validate_image_control(cfg, image, cfg.vm.firecracker_control)?;
+    }
     let payload = BootPayload::prepare(be, cfg, &inst.image, &opts.mounts, forwards)?;
-    let _provisioning = crate::creation_hooks::lock_provisioning(inst)?;
     crate::creation_hooks::CreationState::select(cfg, opts.post_start_override)?.save(inst)?;
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
+    drop(image_lock);
 
     provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &payload)
 }
@@ -1101,7 +1120,6 @@ fn provision_first_boot(
 
     signal::check_shutdown()?;
 
-    // Workspace sync: tar-pipe for --workspace, git clone for --git-repo.
     // Mounts may be additional data directories or the workspace source
     // itself. Only mount-only instances record the first mount as the
     // workspace identity.
@@ -1116,7 +1134,7 @@ fn provision_first_boot(
             .canonicalize()
             .with_context(|| format!("Failed to resolve {ws_dir}"))?;
 
-        workspace::tar_pipe_transfer(&target, &abs_path, opts.exclude_git)?;
+        workspace::copy_workspace(&target, &abs_path, opts.exclude_git)?;
 
         let state = workspace::WorkspaceState {
             guest_path: workspace::default_workspace_path(),
@@ -1174,10 +1192,9 @@ fn provision_first_boot(
     run_configured_post_start(cfg, inst, &target, repo, command.as_deref())?;
 
     tracing::info!(
-        "Instance '{}' started — SSH: {}:{}",
+        "Instance '{}' started — SSH: {}",
         inst.name,
-        target.host,
-        target.port,
+        target.connection_description(),
     );
     Ok(())
 }
@@ -1615,7 +1632,7 @@ pub(crate) fn prepare_session_from_target(
         .transpose()?
         .flatten();
     let repo = assignment.as_ref().map(|a| &a.repo).or(repo);
-    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, suppress_openai_key)?;
+    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, proxy_openai)?;
     if let Some(inst) = inst {
         if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
             for (name, value) in &state.entries {
@@ -1627,6 +1644,7 @@ pub(crate) fn prepare_session_from_target(
                 // `prepare_env_forwarding`.
                 if (proxy_anthropic && name.as_str() == "ANTHROPIC_API_KEY")
                     || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
+                    || (proxy_openai && name.as_str() == "CODEX_ACCESS_TOKEN")
                 {
                     let reason = if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
                         "codex.auth = \"chatgpt\""
@@ -1870,8 +1888,12 @@ pub(crate) fn cmd_resize(
     let stopped = be.as_stopped(inst)?;
 
     if let Some(disk_size) = opts.disk {
-        let current = current_disk_gib(be, stopped.instance())?;
-        let new_size = disk_size.resolve(current)?;
+        let new_size = match disk_size {
+            config::DiskSize::Absolute(size) => size,
+            config::DiskSize::Relative(_) => {
+                disk_size.resolve_from_bytes(current_disk_bytes(be, stopped.instance())?)?
+            }
+        };
         be.resize_disk(cfg, &stopped, new_size)?;
     }
 
@@ -1904,6 +1926,12 @@ pub(crate) fn cmd_commit(
     let inst = cfg.resolve_instance(name)?;
     let source_image = inst.image.clone();
 
+    // Serialize disk/template/metadata publication as one image operation.
+    // Firecracker setup uses the same sibling lock, so it cannot reuse the
+    // fixed staging name while commit is repairing it.
+    let _image_lock = setup::lock_image_publication(cfg, image)?;
+    let destination_existed = cfg.image_dir(image).exists();
+
     // Refuse to clobber an existing image unless asked. Checked before
     // gating on stopped state so a typo'd or already-taken name fails fast.
     if be.image_is_built(cfg, image) && !force {
@@ -1922,10 +1950,19 @@ pub(crate) fn cmd_commit(
             format!("Failed to load template config for source image '{source_image}'")
         })?;
 
-    be.commit_disk(cfg, &stopped, image)?;
-
     template_config.created = setup::utc_timestamp();
-    template_config.save_for(cfg, image)?;
+    template_config.capabilities.clear();
+    be.prepare_committed_image_metadata(&mut template_config);
+    if let Err(error) = be.commit_disk(cfg, &stopped, image, &template_config) {
+        // A pre-publication failure for a new image may leave only the empty
+        // private directory created for staging. Remove it so `coop images`
+        // cannot report a phantom; a marker/disk from an interrupted
+        // publication makes this intentionally fail with DirectoryNotEmpty.
+        if !destination_existed {
+            setup::cleanup_unpublished_image_dir(cfg, image);
+        }
+        return Err(error);
+    }
 
     tracing::info!(
         "Committed instance '{}' to image '{image}'. \
@@ -1992,6 +2029,18 @@ pub(crate) struct ReprovisionOpts<'a> {
 /// leave them alone. [`RestoreMode::Reprovision`] is the other case — a base
 /// image, with nothing on the new disk to preserve — and routes to
 /// [`reprovision_instance`] instead.
+fn ensure_restore_image_usable(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    image: &config::ImageName,
+    control: config::FirecrackerControlMode,
+) -> Result<()> {
+    if !be.image_is_built(cfg, image) {
+        bail!("No image '{image}' found. Run `coop images` to list available images.");
+    }
+    be.validate_image_control(cfg, image, control)
+}
+
 pub(crate) fn cmd_restore(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
@@ -2005,10 +2054,9 @@ pub(crate) fn cmd_restore(
     };
 
     let inst = cfg.resolve_instance(opts.name)?;
+    let _image_lock = setup::lock_image_publication(cfg, image)?;
 
-    if !be.image_is_built(cfg, image) {
-        bail!("No image '{image}' found. Run `coop images` to list available images.");
-    }
+    ensure_restore_image_usable(be, cfg, image, inst.firecracker_control)?;
 
     let stopped = be.as_stopped(inst)?;
     crate::creation_hooks::restore_disk(
@@ -2061,15 +2109,13 @@ fn reprovision_instance(
     let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
     let image = opts.image.cloned().unwrap_or_else(|| inst.image.clone());
 
-    if !be.image_is_built(cfg, &image) {
-        bail!("No image '{image}' found. Run `coop images` to list available images.");
-    }
+    let initial_image_lock = setup::lock_image_publication(cfg, &image)?;
+    ensure_restore_image_usable(be, cfg, &image, inst.firecracker_control)?;
+    drop(initial_image_lock);
 
-    // Ordering rule for the whole pre-swap half: anything that can fail
-    // cheaply runs before `restore_disk`, because a stopped instance can be
-    // started again and a wiped one cannot be un-wiped. Start with the
-    // host-side settings that have to survive the swap, so a malformed state
-    // file aborts with the guest still intact rather than half-reprovisioned.
+    // Load host-side settings before stopping the guest, so malformed state
+    // aborts while it is still running. The image-dependent payload is prepared
+    // under the image lock after the stop, before the disk is replaced.
     let workspace_state = workspace::WorkspaceState::try_load(&inst)?;
     let saved_forwards = port_forward::ForwardsState::try_load(&inst)?
         .map(|s| s.forwards)
@@ -2084,7 +2130,6 @@ fn reprovision_instance(
     // canonicalizes and rejects a missing host directory.
     let ws_inputs = reprovision_workspace_inputs(workspace_state.as_ref())?;
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
-    let payload = BootPayload::prepare(be, cfg, &image, &ws_inputs.mounts, forwards)?;
 
     if !opts.yes
         && !prompt::confirm(&reprovision_confirmation(
@@ -2126,6 +2171,14 @@ fn reprovision_instance(
     // `as_stopped` proof below is what actually gates the disk swap.
     cmd_stop(be, cfg, &inst)?;
 
+    // Re-check and snapshot the image contract only after interactive work is
+    // over, then keep the publication lock through the disk copy and lineage
+    // update. A concurrent forced commit cannot swap the image between its
+    // metadata validation and consumption.
+    let image_lock = setup::lock_image_publication(cfg, &image)?;
+    ensure_restore_image_usable(be, cfg, &image, inst.firecracker_control)?;
+    let payload = prepare_reprovision_payload(be, cfg, &inst, &image, &ws_inputs.mounts, forwards)?;
+
     // The instance's own forward set is authoritative — it already folded in
     // `cfg.forward_ports` at creation; merging again picks up forwards added
     // to `config.toml` since.
@@ -2156,9 +2209,10 @@ fn reprovision_instance(
     let reprovisioned_name = inst.name.clone();
     let stopped = be.as_stopped(inst)?;
 
-    // An image's disk is template-sized, so a `coop resize --disk` is lost in
-    // the swap. Record the size first and re-grow afterwards.
-    let previous_disk = current_disk_gib(be, stopped.instance())?;
+    // The replacement can be smaller than a previously resized disk. Record
+    // the exact old length before the swap so no partial GiB is lost.
+    let previous_disk_bytes = current_disk_bytes(be, stopped.instance())?;
+    let previous_disk = config::GiB::from_bytes_ceil(previous_disk_bytes)?;
 
     // Last chance to honour a Ctrl-C. `install_handlers` only sets a sticky
     // flag, so the SIGINT that arrived during the stop above is recorded but
@@ -2177,15 +2231,26 @@ fn reprovision_instance(
     // instance survives, its guest is only partly provisioned, and re-running
     // finishes the job. It also carries `previous_disk`, which only this
     // process knows: nothing persists an instance's disk size, so a re-run
-    // measures the replaced template-sized file and skips the re-grow.
-    let partial = || reprovision_partial_message(&reprovisioned_name, &image, previous_disk);
+    // measures the replacement image and skips the re-grow.
+    let partial = || {
+        reprovision_partial_message(
+            &reprovisioned_name,
+            &image,
+            previous_disk_bytes,
+            previous_disk,
+        )
+    };
 
     // Persist lineage only after replacement finishes.
     let mut inst = stopped.instance().clone();
     inst.set_image(image.clone()).with_context(partial)?;
+    drop(image_lock);
 
-    if previous_disk > current_disk_gib(be, &inst).with_context(partial)? {
-        be.resize_disk(cfg, &stopped, previous_disk)
+    let replacement_bytes = current_disk_bytes(be, &inst).with_context(partial)?;
+    if let Some(target) =
+        reprovision_regrow_target(previous_disk_bytes, replacement_bytes, previous_disk)
+    {
+        be.resize_disk(cfg, &stopped, target)
             .with_context(partial)?;
     }
 
@@ -2291,6 +2356,23 @@ struct ReprovisionWorkspaceInputs {
     mounts: Vec<config::Mount>,
 }
 
+fn prepare_reprovision_payload(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    mounts: &[config::Mount],
+    forwards: Vec<config::PortForward>,
+) -> Result<BootPayload> {
+    BootPayload::prepare(be, cfg, image, mounts, forwards).with_context(|| {
+        format!(
+            "Instance '{}' is stopped and was not reprovisioned. Fix the host input, then \
+             re-run `coop restore {} --image {} --reprovision` or run `coop start {}` to bring it back as it was.",
+            inst.name, inst.name, image, inst.name
+        )
+    })
+}
+
 /// Rebuild the workspace-shaped `StartOpts` inputs from the association the
 /// instance recorded at creation, so the first-boot sync repopulates the
 /// blank disk from the same source it was originally filled from.
@@ -2351,15 +2433,17 @@ fn reprovision_workspace_inputs(
 fn reprovision_partial_message(
     name: &config::InstanceName,
     image: &config::ImageName,
+    previous_disk_bytes: u64,
     previous_disk: config::GiB,
 ) -> String {
     format!(
         "Instance '{name}' was reset but not fully provisioned. \
          Re-run `coop restore {name} --image {image} --reprovision` to finish.\n\
-         Its disk was {previous_disk} GiB before the reset. Nothing persists \
-         that, and a re-run measures the replaced (template-sized) disk, so \
+         Its disk was {} before the reset. Nothing persists \
+         that, and a re-run measures the replacement image, so \
          check `coop status {name}` and run `coop resize {name} --size \
-         {previous_disk}` if the re-grow did not complete."
+         {previous_disk}` if the re-grow did not complete.",
+        config::format_disk_bytes(previous_disk_bytes),
     )
 }
 
@@ -2395,22 +2479,23 @@ fn reprovision_confirmation(
     )
 }
 
-fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<config::GiB> {
+fn current_disk_bytes(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<u64> {
     let path = be.disk_path(inst)?;
-    let bytes = std::fs::metadata(&path)
+    Ok(std::fs::metadata(&path)
         .with_context(|| format!("Failed to stat {}", path.display()))?
-        .len();
-    config::GiB::new(bytes_to_gib(bytes))
-        .with_context(|| format!("Disk at {} is smaller than 1 GiB", path.display()))
+        .len())
 }
 
-/// Whole gibibytes in `bytes`, rounding down (1 GiB = 1024³ bytes).
-///
-/// The truncating `as u32` is safe for any disk size coop creates: the
-/// template caps well under 4 TiB (`u32::MAX` GiB), so the quotient fits.
-#[expect(clippy::cast_possible_truncation, reason = "disk GiB fits in u32")]
-fn bytes_to_gib(bytes: u64) -> u32 {
-    (bytes / (1024 * 1024 * 1024)) as u32
+fn reprovision_regrow_target(
+    previous_bytes: u64,
+    replacement_bytes: u64,
+    previous_disk: config::GiB,
+) -> Option<config::GiB> {
+    if replacement_bytes < previous_bytes {
+        Some(previous_disk)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -2427,6 +2512,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: crate::config::ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         crate::creation_hooks::CreationState::select(&cfg, None)
             .unwrap()
@@ -2474,7 +2560,7 @@ mod tests {
             check_stale_restart_preserves_creation_progress(std::path::Path::new(&root));
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let controller = root.path().join("limactl");
         std::fs::write(
             &controller,
@@ -2507,12 +2593,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_reports_unknown_process_state_and_preserves_pid_file() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("name"),
             index: super::config::InstanceIndex::new(0).expect("index"),
             dir: root.path().join("instance"),
             image: super::config::ImageName::new("default").expect("image"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).expect("instance dir");
         std::fs::write(inst.pid_file_path(), "invalid-pid").expect("pid file");
@@ -2550,12 +2637,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn confirmed_stop_removes_proxy_before_cleanup_error() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("name"),
             index: super::config::InstanceIndex::new(0).expect("index"),
             dir: root.path().join("instance"),
             image: super::config::ImageName::new("default").expect("image"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).expect("instance dir");
         let proxy_token = inst.dir.join("proxy-openai.token");
@@ -2581,6 +2669,171 @@ mod tests {
             data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_test_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_legacy_firecracker_image(
+        cfg: &super::config::CoopConfig,
+        image: &super::config::ImageName,
+    ) {
+        crate::fs_util::private_dir(&cfg.image_dir(image)).unwrap();
+        std::fs::write(cfg.template_path_for(image), b"legacy disk sentinel").unwrap();
+        std::fs::write(
+            cfg.template_config_path_for(image),
+            r#"{
+                "version": 2,
+                "created": "2026-01-01T00:00:00Z",
+                "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "profiles": [],
+                "extra_packages": [],
+                "post_install_hash": null
+            }"#,
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_creation_rejects_legacy_image_before_allocating_state() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        cfg.vm.firecracker_control = super::config::FirecrackerControlMode::Vsock;
+        let image = super::config::ImageName::new("legacy").unwrap();
+        let name = super::config::InstanceName::new("must-not-exist").unwrap();
+        write_legacy_firecracker_image(&cfg, &image);
+        let config_path = root.path().join("config.toml");
+        let opts = start_opts(Vec::new(), &config_path);
+
+        let error = super::allocate_and_start(
+            &super::backend::FirecrackerBackend::new(),
+            &mut cfg,
+            Some(&name),
+            &image,
+            None,
+            &opts,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("does not contain"), "{error}");
+        assert!(!cfg.instances_dir().join(name.as_str()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_creation_cleans_up_when_provisioning_lock_cannot_open() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        let image = super::config::ImageName::new("legacy").unwrap();
+        let name = super::config::InstanceName::new("lock-failure").unwrap();
+        write_legacy_firecracker_image(&cfg, &image);
+
+        crate::fs_util::private_dir(&cfg.instances_dir()).unwrap();
+        let lock_path = cfg
+            .instances_dir()
+            .join(format!("..{name}.provisioning.operation.lock"));
+        std::os::unix::fs::symlink(cfg.instances_dir(), &lock_path).unwrap();
+
+        let config_path = root.path().join("config.toml");
+        let opts = start_opts(Vec::new(), &config_path);
+        let error = super::allocate_and_start(
+            &super::backend::FirecrackerBackend::new(),
+            &mut cfg,
+            Some(&name),
+            &image,
+            None,
+            &opts,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Failed to open operation lock"), "{error}");
+        assert!(!cfg.instances_dir().join(name.as_str()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn vsock_instance_with_disk(
+        cfg: &mut super::config::CoopConfig,
+        name: &super::config::InstanceName,
+    ) -> super::config::Instance {
+        let image = super::config::default_image_name();
+        cfg.vm.firecracker_control = super::config::FirecrackerControlMode::Vsock;
+        let inst = cfg.allocate_instance(Some(name), &image, None).unwrap();
+        std::fs::write(inst.rootfs_path(), b"original instance disk").unwrap();
+        inst
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_restore_rejects_legacy_image_before_disk_or_state_mutation() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        let name = super::config::InstanceName::new("restore-proof").unwrap();
+        let inst = vsock_instance_with_disk(&mut cfg, &name);
+        let target = super::config::ImageName::new("legacy").unwrap();
+        write_legacy_firecracker_image(&cfg, &target);
+        let state_before = std::fs::read(inst.dir.join("instance.json")).unwrap();
+        let disk_before = std::fs::read(inst.rootfs_path()).unwrap();
+        let opts = super::RestoreOpts {
+            name: Some(&name),
+            mode: super::RestoreMode::DiskOnly { image: &target },
+        };
+
+        let error = super::cmd_restore(&super::backend::FirecrackerBackend::new(), &mut cfg, &opts)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not contain"), "{error}");
+        assert_eq!(std::fs::read(inst.rootfs_path()).unwrap(), disk_before);
+        assert_eq!(
+            std::fs::read(inst.dir.join("instance.json")).unwrap(),
+            state_before
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_reprovision_rejects_legacy_image_before_disk_or_state_mutation() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        let name = super::config::InstanceName::new("reprovision-proof").unwrap();
+        let inst = vsock_instance_with_disk(&mut cfg, &name);
+        let target = super::config::ImageName::new("legacy").unwrap();
+        write_legacy_firecracker_image(&cfg, &target);
+        let state_before = std::fs::read(inst.dir.join("instance.json")).unwrap();
+        let disk_before = std::fs::read(inst.rootfs_path()).unwrap();
+        let config_path = root.path().join("config.toml");
+        let opts = super::RestoreOpts {
+            name: Some(&name),
+            mode: super::RestoreMode::Reprovision(super::ReprovisionOpts {
+                image: Some(&target),
+                yes: true,
+                no_agents: true,
+                no_prompt: true,
+                config_path: &config_path,
+            }),
+        };
+
+        let error = super::cmd_restore(&super::backend::FirecrackerBackend::new(), &mut cfg, &opts)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not contain"), "{error}");
+        assert_eq!(std::fs::read(inst.rootfs_path()).unwrap(), disk_before);
+        assert_eq!(
+            std::fs::read(inst.dir.join("instance.json")).unwrap(),
+            state_before
+        );
     }
 
     #[test]
@@ -2610,17 +2863,18 @@ mod tests {
     }
 
     fn assert_interrupted_post_start() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = instance_named("test", tmp.path());
         std::fs::create_dir(inst.model_state_path()).unwrap();
         let mut cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         cfg.post_start = Some("true".to_string());
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").unwrap(),
-            port: std::num::NonZeroU16::new(22).unwrap(),
-            user: super::backend::SshUser::new("ubuntu").unwrap(),
-            key_path: tmp.path().join("id_test"),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").unwrap(),
+            std::num::NonZeroU16::new(22).unwrap(),
+            super::backend::SshUser::new("ubuntu").unwrap(),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
         let error =
             super::run_configured_post_start(&cfg, &inst, &target, None, cfg.post_start.as_deref())
                 .unwrap_err();
@@ -2893,13 +3147,14 @@ mod tests {
     fn prepare_session_overlays_persisted_guest_env() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
         state.entries.insert(
@@ -2920,12 +3175,13 @@ mod tests {
             "cfg-value".to_string(),
         );
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
@@ -2972,13 +3228,14 @@ mod tests {
     fn prepare_session_suppresses_persisted_proxy_key() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
         state.entries.insert(
@@ -2997,12 +3254,13 @@ mod tests {
             auth: super::config::ProxyAuthScheme::ApiKey,
         });
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
@@ -3023,13 +3281,14 @@ mod tests {
     fn prepare_session_suppresses_persisted_openai_key_for_chatgpt_auth() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
         state.entries.insert(
@@ -3045,12 +3304,13 @@ mod tests {
         let mut cfg = super::config::CoopConfig::default();
         cfg.codex.auth = super::config::CodexAuthMode::ChatGpt;
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
@@ -3071,13 +3331,14 @@ mod tests {
     fn prepare_session_survives_chatgpt_auth_with_openai_proxy() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
 
         let mut cfg = super::config::CoopConfig::default();
@@ -3087,12 +3348,13 @@ mod tests {
             auth: super::config::ProxyAuthScheme::Bearer,
         });
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         // The conflict makes Codex unusable, not the VM: a shell/exec/claude
         // session on the same instance must still come up. `coop codex` and
@@ -3108,16 +3370,98 @@ mod tests {
     }
 
     #[test]
+    fn prepare_session_suppresses_persisted_codex_token_for_effective_proxy() {
+        use std::num::NonZeroU16;
+
+        for per_vm in [false, true] {
+            for auth in [
+                super::config::ProxyAuthScheme::Bearer,
+                super::config::ProxyAuthScheme::CodexAccessToken,
+            ] {
+                let tmp = crate::test_support::private_tempdir().unwrap();
+                let inst = super::config::Instance {
+                    name: super::config::InstanceName::new("test").unwrap(),
+                    index: super::config::InstanceIndex::new(0).unwrap(),
+                    dir: tmp.path().to_path_buf(),
+                    image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+                    firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
+                };
+                let mut state = super::guest_env_state::GuestEnvState::default();
+                for (name, value) in [
+                    ("CODEX_ACCESS_TOKEN", "at-private"),
+                    ("FROM_CLI", "saved-value"),
+                ] {
+                    state.entries.insert(
+                        super::guest_env_state::EnvVarName::new(name).unwrap(),
+                        value.to_string(),
+                    );
+                }
+                state.save(&inst).unwrap();
+                let mut cfg = super::config::CoopConfig::default();
+                let upstream = super::config::ProxyUpstream {
+                    credential: super::config::Secret::new("cmd:false".to_string()),
+                    auth,
+                };
+                if per_vm {
+                    super::proxy_state::ProxyState {
+                        openai: Some(upstream),
+                        ..Default::default()
+                    }
+                    .save(&inst)
+                    .unwrap();
+                } else {
+                    cfg.proxy.openai = Some(upstream);
+                }
+                let target = super::backend::SshTarget::tcp(
+                    super::backend::Hostname::new("127.0.0.1").unwrap(),
+                    NonZeroU16::new(22).unwrap(),
+                    super::backend::SshUser::new("ubuntu").unwrap(),
+                    tmp.path().join("id_test"),
+                    cfg.ssh.host_tools.clone(),
+                );
+                let session =
+                    super::prepare_session_from_target(&cfg, Some(&inst), target.clone(), None)
+                        .unwrap();
+                assert!(!session.env.contains("CODEX_ACCESS_TOKEN"));
+                assert_eq!(
+                    session
+                        .env
+                        .guest_values()
+                        .get("FROM_CLI")
+                        .map(String::as_str),
+                    Some("saved-value")
+                );
+                let model = super::model_state::ModelState {
+                    mode: super::model_state::ModelMode::Local,
+                    ..Default::default()
+                };
+                model.save(&inst).unwrap();
+                let local =
+                    super::prepare_session_from_target(&cfg, Some(&inst), target, None).unwrap();
+                assert_eq!(
+                    local
+                        .env
+                        .guest_values()
+                        .get("CODEX_ACCESS_TOKEN")
+                        .map(String::as_str),
+                    Some("at-private")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn prepare_session_suppresses_openai_key_for_chatgpt_auth_without_proxy() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
 
         // No `[proxy.openai]`, so ChatGPT account auth is the *only* reason
@@ -3134,12 +3478,13 @@ mod tests {
         );
         assert!(cfg.proxy.openai.is_none(), "fixture must have no proxy");
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
             .expect("ChatGPT account auth must not break session preparation");
@@ -3162,14 +3507,15 @@ mod tests {
     fn prepare_session_skips_overlay_without_instance() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = super::config::CoopConfig::default();
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, None, target, None).expect("session");
@@ -3233,7 +3579,7 @@ mod tests {
         // at `/workspace` on a reprovision would be a silent relocation.
         // A real directory: `Mount::from_parts` canonicalizes and rejects a
         // host path that is not one.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let host = tmp.path().canonicalize().expect("canonical tempdir");
         let state = ws_state_at(
             super::workspace::WorkspaceSource::Mount {
@@ -3259,7 +3605,7 @@ mod tests {
         // reaches `rsync`, which parses its own source argument. Routing it
         // through `Mount::from_parts` is what rejects it, and doing so before
         // the disk swap is what keeps the instance recoverable.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let not_a_dir = tmp.path().join("regular-file");
         std::fs::write(&not_a_dir, b"x").expect("write file");
 
@@ -3280,7 +3626,7 @@ mod tests {
     #[test]
     fn check_reprovision_workspace_source_accepts_a_live_host_directory() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let state = ws_state(super::workspace::WorkspaceSource::Workspace {
             host_path: tmp.path().to_path_buf(),
         });
@@ -3328,7 +3674,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
 
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         // 0xFF is not valid UTF-8 in any position.
         let host_path = tmp.path().join(std::ffi::OsStr::from_bytes(b"proj-\xff"));
         std::fs::create_dir(&host_path).expect("create non-UTF-8 dir");
@@ -3356,7 +3702,7 @@ mod tests {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
         let image = super::config::ImageName::new("rust").expect("valid image name");
         let disk = super::config::GiB::new(20).expect("20 is non-zero");
-        let msg = super::reprovision_partial_message(&name, &image, disk);
+        let msg = super::reprovision_partial_message(&name, &image, disk.as_bytes(), disk);
         // Attached to every failure after the disk is gone, so it has to say
         // both that the instance survived and how to finish the job.
         assert!(msg.contains("myvm"), "{msg}");
@@ -3369,12 +3715,23 @@ mod tests {
             "{msg}"
         );
         // Nothing persists an instance's disk size, so a re-run measures the
-        // replaced template-sized file and skips the re-grow. The size this
+        // replacement image and skips the re-grow. The size this
         // process read before the swap is the only record of it, so the
         // message has to carry both the number and the command that reapplies
         // it — otherwise a prior `coop resize` is silently dropped.
         assert!(msg.contains("20 GiB"), "{msg}");
         assert!(msg.contains("coop resize myvm --size 20"), "{msg}");
+        let nonaligned = super::reprovision_partial_message(
+            &name,
+            &image,
+            super::config::GIB_BYTES + 4096,
+            super::config::GiB::new(2).unwrap(),
+        );
+        assert!(nonaligned.contains("1073745920 bytes"), "{nonaligned}");
+        assert!(
+            nonaligned.contains("coop resize myvm --size 2"),
+            "{nonaligned}"
+        );
     }
 
     #[test]
@@ -3452,7 +3809,7 @@ mod tests {
 
     #[test]
     fn resolve_start_repo_uses_first_mount_origin() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         run_git(tmp.path(), &["init", "-q"]);
         run_git(
             tmp.path(),
@@ -3478,7 +3835,7 @@ mod tests {
 
     #[test]
     fn resolve_start_repo_returns_none_for_non_github_mount() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         run_git(tmp.path(), &["init", "-q"]);
         run_git(
             tmp.path(),
@@ -3496,7 +3853,7 @@ mod tests {
 
     #[test]
     fn resolve_start_repo_returns_none_for_no_mounts() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(Vec::new(), &cfg_path);
         let slug = super::resolve_start_repo(&opts).expect("ok");
@@ -3505,7 +3862,7 @@ mod tests {
 
     #[test]
     fn restart_ignored_flags_allows_workspace_affinity_key() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let mut opts = start_opts(Vec::new(), &cfg_path);
         opts.workspace_dir = Some("/some/workspace");
@@ -3514,7 +3871,7 @@ mod tests {
 
     #[test]
     fn restart_ignored_flags_rejects_workspace_with_explicit_name() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let name = super::config::InstanceName::new("explicit").expect("valid name");
         let mut opts = start_opts(Vec::new(), &cfg_path);
@@ -3525,7 +3882,7 @@ mod tests {
 
     #[test]
     fn no_stopped_instance_message_points_creation_to_up() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(Vec::new(), &cfg_path);
         let msg = super::no_stopped_instance_message(&opts, None);
@@ -3534,7 +3891,7 @@ mod tests {
 
     #[test]
     fn find_git_repo_instance_returns_none_when_unmatched() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let found = super::find_git_repo_instance(&cfg, "https://example.com/org/absent.git")
             .expect("lookup");
@@ -3543,7 +3900,7 @@ mod tests {
 
     #[test]
     fn find_git_repo_instance_errors_on_multiple_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let repo_url = "https://github.com/trailofbits/coop.git";
@@ -3563,7 +3920,7 @@ mod tests {
 
     #[test]
     fn ensure_up_git_repo_name_matches_rejects_mismatch() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let inst = cfg.allocate_instance(None, &img, None).expect("inst");
@@ -3580,7 +3937,7 @@ mod tests {
 
     #[test]
     fn up_copy_rejects_extra_mount_at_workspace() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let data = tmp.path().join("data");
         std::fs::create_dir(&data).expect("data");
         let mounts = vec![super::config::Mount::parse(data.to_str().unwrap()).expect("mount")];
@@ -3611,7 +3968,7 @@ mod tests {
 
     #[test]
     fn up_existing_rejects_creation_only_inputs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3633,7 +3990,7 @@ mod tests {
 
     #[test]
     fn up_existing_rejects_mismatched_profile_target() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3660,7 +4017,7 @@ mod tests {
 
     #[test]
     fn up_existing_rejects_mismatched_explicit_name() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3679,7 +4036,7 @@ mod tests {
 
     #[test]
     fn up_existing_git_repo_rejects_creation_only_inputs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let repo_url = "https://github.com/trailofbits/coop.git";
@@ -3708,7 +4065,7 @@ mod tests {
 
     #[test]
     fn up_running_rejects_restart_only_inputs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3726,7 +4083,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_returns_none_when_no_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let ws = tmp.path().join("project");
         std::fs::create_dir(&ws).expect("create_dir");
@@ -3736,7 +4093,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_finds_single_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let ws = tmp.path().join("project");
@@ -3755,7 +4112,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_bails_on_multiple_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let ws = tmp.path().join("project");
@@ -3787,7 +4144,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_ignores_unrelated_workspaces() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let ws_a = tmp.path().join("a");
@@ -3806,19 +4163,53 @@ mod tests {
     }
 
     #[test]
-    fn bytes_to_gib_truncates_to_whole_gibibytes() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        assert_eq!(super::bytes_to_gib(0), 0);
-        assert_eq!(super::bytes_to_gib(GIB), 1);
+    fn nonaligned_disk_rounds_up_for_relative_resize_and_reprovision() {
+        let base = super::config::GIB_BYTES + 4096;
+        let target = super::config::DiskSize::Relative(super::config::GiB::new(1).unwrap())
+            .resolve_from_bytes(base)
+            .unwrap();
+        assert_eq!(target.as_u32(), 3);
+        let absolute = super::config::DiskSize::Absolute(super::config::GiB::new(1).unwrap())
+            .resolve_from_bytes(base)
+            .unwrap();
+        assert_eq!(absolute.as_u32(), 1);
+        let preserved = super::config::GiB::from_bytes_ceil(base).unwrap();
         assert_eq!(
-            super::bytes_to_gib(GIB - 1),
-            0,
-            "just under 1 GiB rounds down"
+            super::reprovision_regrow_target(base, super::config::GIB_BYTES, preserved)
+                .unwrap()
+                .as_u32(),
+            2
+        );
+        assert!(
+            super::reprovision_regrow_target(base, 2 * super::config::GIB_BYTES, preserved)
+                .is_none()
+        );
+        assert!(super::reprovision_regrow_target(base, base, preserved).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn firecracker_rejects_absolute_target_below_nonaligned_image() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = instance_named("size-boundary", root.path());
+        std::fs::create_dir_all(&inst.dir).unwrap();
+        let rootfs = inst.rootfs_path();
+        std::fs::File::create(&rootfs)
+            .unwrap()
+            .set_len(super::config::GIB_BYTES + 4096)
+            .unwrap();
+        let stopped = super::backend::FirecrackerBackend::new()
+            .as_stopped(inst)
+            .unwrap();
+        let error =
+            crate::setup::resize_rootfs(&stopped, super::config::GiB::new(1).unwrap()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Shrinking is not supported (current image: 1 GiB + 4096 bytes (1073745920 bytes); requested: 1 GiB (1073741824 bytes))"
         );
         assert_eq!(
-            super::bytes_to_gib(2 * GIB + 512 * 1024 * 1024),
-            2,
-            "2.5 GiB truncates toward zero"
+            std::fs::metadata(rootfs).unwrap().len(),
+            super::config::GIB_BYTES + 4096
         );
     }
 
@@ -3836,12 +4227,13 @@ mod tests {
             dir: dir.to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 
     #[test]
     fn creation_options_rejected_message_names_instance_and_recovery() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = instance_named("demo", tmp.path());
         let msg = super::creation_options_rejected_message(&inst);
         assert!(msg.contains("demo"), "{msg}");
@@ -3854,7 +4246,7 @@ mod tests {
     /// *different* image). Pins the `!=` comparison at the image check.
     #[test]
     fn up_existing_accepts_matching_image() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3882,7 +4274,7 @@ mod tests {
     /// `extra_mount` emptiness test.
     #[test]
     fn up_existing_rejects_each_creation_flag_alone() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3925,7 +4317,7 @@ mod tests {
     /// a matching transport).
     #[test]
     fn up_existing_accepts_matching_transport() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3947,7 +4339,7 @@ mod tests {
 
     #[test]
     fn up_existing_git_repo_accepts_matching_image_and_profile() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
 
         // Matching --image is compatible.
@@ -3976,7 +4368,7 @@ mod tests {
 
     #[test]
     fn up_existing_git_repo_rejects_each_creation_flag_alone() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let inst = cfg
             .allocate_instance(None, &super::config::default_image_name(), None)

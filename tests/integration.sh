@@ -167,6 +167,36 @@ guest_stderr() {
     cat "$tmpdir/guest_stderr" 2>/dev/null
 }
 
+lima_display() {
+    limactl list --json | python3 -c '
+import json
+import sys
+
+target = sys.argv[1]
+for line in sys.stdin:
+    entry = json.loads(line)
+    if entry.get("name") == target:
+        print(entry.get("config", {}).get("video", {}).get("display", ""))
+        raise SystemExit(0)
+raise SystemExit(1)
+' "coop-$INSTANCE"
+}
+
+# Assert the effective Lima configuration stays headless. This is intentionally
+# end-to-end: it catches create or restart paths that bypass coop's shared
+# headless launcher or persist a graphical display in lima.yaml.
+assert_lima_headless() {
+    local phase="$1" display=""
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        return
+    fi
+    if display=$(lima_display) && [[ "$display" == "none" ]]; then
+        pass "Lima stays headless $phase"
+    else
+        fail "Lima stays headless $phase" "video.display=${display:-missing}"
+    fi
+}
+
 # Cross-platform timeout wrapper. Prefer GNU timeout (Linux, or macOS with
 # coreutils installed as `gtimeout`); fall back to a perl-based implementation
 # since perl ships in the macOS base system.
@@ -292,8 +322,7 @@ test_completions() {
     echo ""
     echo "=== Phase: shell completions ==="
 
-    # Static script generation — must succeed for each supported shell and
-    # the bash script must reference our subcommands.
+    # Dynamic script generation must succeed for each supported shell.
     for shell in bash zsh fish powershell elvish; do
         if coop completions "$shell" >/dev/null; then
             pass "completions $shell exits 0"
@@ -302,25 +331,30 @@ test_completions() {
         fi
     done
 
-    if coop completions bash; then
+    local dyn_out
+    if dyn_out=$(bash --noprofile --norc -c '
+        completion_binary=$1
+        source /dev/stdin <<<"$("$completion_binary" completions bash)"
+        coop() { "$completion_binary" "$@"; }
+        COMP_WORDS=(coop "")
+        COMP_CWORD=1
+        COMP_TYPE=9
+        _clap_complete_coop coop ""
+        printf "%s\n" "${COMPREPLY[@]}"
+    ' bash "$BINARY" 2>&1); then
         for sub in shell claude destroy completions; do
-            # Here-string, not `echo | grep -q`: pipefail + early grep match
-            # SIGPIPE's bash's echo on this 48 KB script and turns matches into false misses.
-            if grep -q "coop,$sub" <<<"$HARNESS_OUT"; then
-                pass "bash completion script references \`$sub\`"
+            if grep -Fxq "$sub" <<<"$dyn_out"; then
+                pass "generated bash completion offers \`$sub\`"
             else
-                fail "bash completion script references \`$sub\`" \
-                    "output (truncated): $(head -c 400 <<<"$HARNESS_OUT")"
+                fail "generated bash completion offers \`$sub\`" "got: $dyn_out"
             fi
         done
     else
-        fail "bash completion script content check" \
-             "completions bash exited non-zero: $?, stderr: $HARNESS_ERR"
+        fail "generated bash completion request exits 0" "exit code: $?, output: $dyn_out"
     fi
 
     # Dynamic completion: the engine must return a usable subcommand list
     # when called via the CompleteEnv protocol.
-    local dyn_out
     if dyn_out=$(_CLAP_COMPLETE_INDEX=1 _CLAP_IFS=$'\013' \
                  COMPLETE=bash "$BINARY" -- coop "" 2>&1); then
         for sub in shell claude destroy completions; do
@@ -625,6 +659,17 @@ EOF
         echo "FATAL: primary instance creation failed, cannot continue"
         exit 1
     fi
+    assert_lima_headless "after creation"
+
+    if [[ "$(uname -s)" == Linux ]]; then
+        local instance_state="$HOME/.coop/instances/$INSTANCE/instance.json"
+        if grep -q '"firecracker_control": "vsock"' "$instance_state"; then
+            pass "new opt-in Firecracker instance persists vsock control mode"
+        else
+            fail "new opt-in Firecracker instance persists vsock control mode" \
+                "state: $(cat "$instance_state" 2>/dev/null)"
+        fi
+    fi
 
     local copied_file="" env_value=""
     if copied_file=$(guest_exec cat /workspace/.devcontainer/devcontainer.json) \
@@ -909,6 +954,51 @@ test_shell_connectivity() {
         pass "shell command output correct"
     else
         fail "shell command output correct" "got: $output"
+    fi
+}
+
+test_firecracker_vsock_transport() {
+    echo ""
+    echo "=== Phase: Firecracker vsock transport ==="
+
+    if [[ "$(uname -s)" != Linux ]]; then
+        skip "Firecracker vsock transport" "Firecracker-only"
+        return
+    fi
+
+    if guest_exec systemctl is-active --quiet coop-vsock-ssh.socket; then
+        pass "guest AF_VSOCK SSH listener is active"
+    else
+        fail "guest AF_VSOCK SSH listener is active" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    local socket_path="$HOME/.coop/instances/$INSTANCE/vsock.sock"
+    local proxy_command
+    printf -v proxy_command '%q __vsock-proxy --socket %q --port 22' \
+        "$BINARY" "$socket_path"
+    local output
+    if output=$(_timeout 30 ssh \
+        -F none \
+        -o BatchMode=yes \
+        -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o GlobalKnownHostsFile=/dev/null \
+        -o IdentitiesOnly=yes \
+        -o IdentityAgent=none \
+        -o "IdentityFile=$HOME/.coop/vm_key" \
+        -o "ProxyCommand=$proxy_command" \
+        ubuntu@coop-vsock printf vsock-control-ok 2>"$tmpdir/vsock-ssh-stderr"); then
+        if [[ "$output" == "vsock-control-ok" ]]; then
+            pass "OpenSSH reaches the guest through the Rust vsock ProxyCommand"
+        else
+            fail "OpenSSH reaches the guest through the Rust vsock ProxyCommand" \
+                "unexpected output: $output"
+        fi
+    else
+        fail "OpenSSH reaches the guest through the Rust vsock ProxyCommand" \
+            "$(cat "$tmpdir/vsock-ssh-stderr" 2>/dev/null)"
     fi
 }
 
@@ -2702,6 +2792,345 @@ test_guest_fingerprint() {
     cp "$fp" "$dest" 2>/dev/null || true
 }
 
+# Prove that every management surface selected for a vsock-mode Firecracker
+# instance remains usable after the guest IP path is deliberately removed.
+# The NIC remains configured for compatibility and recovery; this test only
+# establishes control-plane independence.
+test_vsock_control_without_guest_network() {
+    echo ""
+    echo "=== Phase: vsock control without guest network ==="
+
+    if [[ "$(uname -s)" != Linux ]]; then
+        skip "vsock control without guest network" "Firecracker-only"
+        return
+    fi
+
+    local alias="coop-$INSTANCE"
+    local ssh_cfg="$HOME/.ssh/config"
+    local marker="# coop START $alias"
+    if ! coop ssh-config "$INSTANCE"; then
+        fail "generated SSH config installs for vsock instance" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if grep -A12 -F "$marker" "$ssh_cfg" 2>/dev/null \
+        | grep -q 'ProxyCommand .*__vsock-proxy'; then
+        pass "generated SSH config selects the vsock ProxyCommand"
+    else
+        fail "generated SSH config selects the vsock ProxyCommand" \
+            "block missing ProxyCommand"
+    fi
+
+    if guest_exec sudo ip link set eth0 down \
+        && guest_exec sh -c "! ip -4 addr show dev eth0 | grep -q 'inet '"; then
+        pass "guest eth0 is down"
+    else
+        fail "guest eth0 is down" "stderr: $(guest_stderr)"
+        coop ssh-config "$INSTANCE" --clean >/dev/null 2>&1 || true
+        return
+    fi
+
+    local output=""
+    if output=$(coop_exec printf exec-vsock-ok) && [[ "$output" == "exec-vsock-ok" ]]; then
+        pass "exec works with eth0 down"
+    else
+        fail "exec works with eth0 down" "output: $output; stderr: $(guest_stderr)"
+    fi
+    if output=$(guest_exec printf shell-vsock-ok) && [[ "$output" == "shell-vsock-ok" ]]; then
+        pass "shell works with eth0 down"
+    else
+        fail "shell works with eth0 down" "output: $output; stderr: $(guest_stderr)"
+    fi
+    if output=$(_timeout 30 ssh "$alias" printf config-vsock-ok 2>"$tmpdir/vsock-config-stderr") \
+        && [[ "$output" == "config-vsock-ok" ]]; then
+        pass "generated SSH config connects with eth0 down"
+    else
+        fail "generated SSH config connects with eth0 down" \
+            "output: $output; stderr: $(cat "$tmpdir/vsock-config-stderr" 2>/dev/null)"
+    fi
+
+    printf 'scp-vsock-ok\n' > "$tmpdir/vsock-scp.txt"
+    if _timeout 30 scp "$tmpdir/vsock-scp.txt" "$alias:/tmp/vsock-scp.txt" \
+        2>"$tmpdir/vsock-scp-stderr" \
+        && output=$(guest_exec cat /tmp/vsock-scp.txt) \
+        && [[ "$output" == "scp-vsock-ok" ]]; then
+        pass "scp works with eth0 down"
+    else
+        fail "scp works with eth0 down" \
+            "output: $output; stderr: $(cat "$tmpdir/vsock-scp-stderr" 2>/dev/null)"
+    fi
+
+    printf 'rsync-vsock-ok\n' > "$tmpdir/vsock-rsync.txt"
+    if _timeout 30 rsync -a "$tmpdir/vsock-rsync.txt" "$alias:/tmp/vsock-rsync.txt" \
+        2>"$tmpdir/vsock-rsync-stderr" \
+        && output=$(guest_exec cat /tmp/vsock-rsync.txt) \
+        && [[ "$output" == "rsync-vsock-ok" ]]; then
+        pass "rsync works with eth0 down"
+    else
+        fail "rsync works with eth0 down" \
+            "output: $output; stderr: $(cat "$tmpdir/vsock-rsync-stderr" 2>/dev/null)"
+    fi
+
+    local guest_http_port=18765
+    local host_forward_port
+    host_forward_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+    guest_exec sh -c "cat > /tmp/vsock-forward.py <<'PYEOF'
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $guest_http_port))
+s.listen(1)
+c, _ = s.accept()
+c.recv(65536)
+body = b'local-forward-vsock-ok'
+c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s' % (len(body), body))
+c.close()
+PYEOF
+nohup python3 /tmp/vsock-forward.py >/tmp/vsock-forward.log 2>&1 &" || true
+    sleep 1
+    ssh -N -o ExitOnForwardFailure=yes \
+        -L "127.0.0.1:${host_forward_port}:127.0.0.1:${guest_http_port}" \
+        "$alias" >"$tmpdir/vsock-local-forward-out" 2>&1 &
+    local local_forward_pid=$!
+    sleep 1
+    if output=$(curl -fsS --max-time 5 "http://127.0.0.1:${host_forward_port}/") \
+        && [[ "$output" == "local-forward-vsock-ok" ]]; then
+        pass "SSH local forwarding works with eth0 down"
+    else
+        fail "SSH local forwarding works with eth0 down" \
+            "output: $output; ssh: $(cat "$tmpdir/vsock-local-forward-out" 2>/dev/null)"
+    fi
+    kill "$local_forward_pid" 2>/dev/null || true
+    wait "$local_forward_pid" 2>/dev/null || true
+
+    local host_http_port guest_reverse_port=18766
+    host_http_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+    cat > "$tmpdir/vsock-host-http.py" <<'PYEOF'
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', int(sys.argv[1])))
+s.listen(1)
+c, _ = s.accept()
+c.recv(65536)
+body = b'reverse-forward-vsock-ok'
+c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s' % (len(body), body))
+c.close()
+PYEOF
+    python3 "$tmpdir/vsock-host-http.py" "$host_http_port" \
+        >"$tmpdir/vsock-host-http-out" 2>&1 &
+    local host_http_pid=$!
+    ssh -N -o ExitOnForwardFailure=yes \
+        -R "127.0.0.1:${guest_reverse_port}:127.0.0.1:${host_http_port}" \
+        "$alias" >"$tmpdir/vsock-reverse-forward-out" 2>&1 &
+    local reverse_forward_pid=$!
+    sleep 1
+    if output=$(guest_exec curl -fsS --max-time 5 "http://127.0.0.1:${guest_reverse_port}/") \
+        && [[ "$output" == "reverse-forward-vsock-ok" ]]; then
+        pass "SSH reverse forwarding works with eth0 down"
+    else
+        fail "SSH reverse forwarding works with eth0 down" \
+            "output: $output; ssh: $(cat "$tmpdir/vsock-reverse-forward-out" 2>/dev/null)"
+    fi
+    kill "$reverse_forward_pid" "$host_http_pid" 2>/dev/null || true
+    wait "$reverse_forward_pid" 2>/dev/null || true
+    wait "$host_http_pid" 2>/dev/null || true
+
+    # Leave two independent witnesses for the lifecycle operations below.
+    # The shutdown hook is reached only through an orderly guest reboot; a
+    # host SIGTERM fallback cannot create either marker. Masking networkd makes
+    # the following boot unable to regain the legacy TCP control path before
+    # `coop start` declares the guest ready.
+    local shutdown_witness="coop-vsock-graceful-${INSTANCE}-$$"
+    local shutdown_service="/etc/systemd/system/coop-vsock-test-witness.service"
+    if guest_exec sudo sh -c "printf '%s\n' '[Unit]' 'Description=coop vsock integration shutdown witness' '[Service]' 'Type=oneshot' 'ExecStart=/bin/true' 'RemainAfterExit=yes' \"ExecStop=/bin/sh -c 'echo $shutdown_witness > /dev/ttyS0; touch /var/lib/$shutdown_witness'\" '[Install]' 'WantedBy=multi-user.target' > '$shutdown_service' && systemctl daemon-reload && systemctl enable --now coop-vsock-test-witness.service" \
+        && guest_exec sudo systemctl mask systemd-networkd.service; then
+        pass "install graceful-shutdown witness and disable boot networking"
+    else
+        fail "install graceful-shutdown witness and disable boot networking" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    local stop_started=$SECONDS stop_request_clean=""
+    if coop stop "$INSTANCE"; then
+        local stop_elapsed=$((SECONDS - stop_started))
+        if (( stop_elapsed < 10 )) \
+            && ! grep -q 'Cannot request graceful guest shutdown' <<<"$HARNESS_ERR"; then
+            stop_request_clean=1
+            pass "networkless stop completes without the SSH fallback diagnostic"
+        else
+            fail "networkless stop completes without the SSH fallback diagnostic" \
+                "elapsed=${stop_elapsed}s; stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "networkless stop completes without the SSH fallback diagnostic" \
+            "stderr: $HARNESS_ERR"
+    fi
+    if coop start "$INSTANCE" --no-agents; then
+        if [[ "$stop_request_clean" == 1 ]] \
+            && guest_exec test -e "/var/lib/$shutdown_witness"; then
+            pass "graceful shutdown request reaches the guest over vsock"
+        else
+            fail "graceful shutdown request reaches the guest over vsock" \
+                "guest shutdown witness is missing"
+        fi
+        if guest_exec sh -c "! ip -4 addr show dev eth0 | grep -q 'inet '"; then
+            pass "vsock boot readiness succeeds while TCP networking is disabled"
+        else
+            fail "vsock boot readiness succeeds while TCP networking is disabled" \
+                "eth0 regained an address; stderr: $(guest_stderr)"
+        fi
+    else
+        fail "vsock boot readiness succeeds while TCP networking is disabled" \
+            "stderr: $HARNESS_ERR"
+    fi
+    if guest_exec sudo systemctl unmask systemd-networkd.service \
+        && guest_exec sudo systemctl restart systemd-networkd.service \
+        && guest_exec sh -c "for i in \$(seq 1 20); do ip -4 addr show dev eth0 | grep -q 'inet ' && exit 0; sleep 1; done; exit 1" \
+        && guest_exec sudo systemctl disable --now coop-vsock-test-witness.service \
+        && guest_exec sudo rm -f "$shutdown_service" "/var/lib/$shutdown_witness" \
+        && guest_exec sudo systemctl daemon-reload; then
+        pass "restore guest networking after vsock boot proof"
+    else
+        fail "restore guest networking after vsock boot proof" "stderr: $(guest_stderr)"
+    fi
+    coop ssh-config "$INSTANCE" --clean >/dev/null 2>&1 || true
+}
+
+# Old instance.json files have no firecracker_control field and must continue
+# to select TCP without being rewritten merely because the instance was read.
+# Reuse the primary image/disk to keep this compatibility proof bounded.
+test_legacy_firecracker_control_compatibility() {
+    echo ""
+    echo "=== Phase: legacy Firecracker control compatibility ==="
+
+    if [[ "$(uname -s)" != Linux ]]; then
+        skip "legacy Firecracker control compatibility" "Firecracker-only"
+        return
+    fi
+
+    local state="$HOME/.coop/instances/$INSTANCE/instance.json"
+    if ! guest_exec sudo systemctl disable coop-vsock-ssh.socket; then
+        fail "disable vsock listener before legacy compatibility proof" \
+            "stderr: $(guest_stderr)"
+        return
+    fi
+    if ! coop stop "$INSTANCE"; then
+        fail "stop before legacy Firecracker compatibility proof" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if ! python3 - "$state" <<'PYEOF'
+import json, os, sys
+path = sys.argv[1]
+with open(path) as f:
+    state = json.load(f)
+state.pop("firecracker_control", None)
+staging = path + ".legacy-test"
+with open(staging, "w") as f:
+    json.dump(state, f, indent=2)
+    f.write("\n")
+os.replace(staging, path)
+PYEOF
+    then
+        fail "create untagged legacy instance state fixture"
+        coop start "$INSTANCE" --no-agents >/dev/null 2>&1 || true
+        return
+    fi
+    local state_before
+    state_before=$(cksum "$state")
+
+    # Old stopped Firecracker VMs retain root-owned API and base vsock socket
+    # entries after the PID file disappears. Recreate that directory state,
+    # rather than testing only an untagged freshly stopped VM.
+    local instance_dir="$HOME/.coop/instances/$INSTANCE"
+    local api_socket="$instance_dir/firecracker.socket"
+    local vsock_socket="$instance_dir/vsock.sock"
+    if ! sudo -n python3 - "$api_socket" "$vsock_socket" <<'PYEOF'
+import os, socket, sys
+os.umask(0o022)
+for path in sys.argv[1:]:
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(path)
+    listener.close()
+PYEOF
+    then
+        fail "create root-owned stopped legacy socket fixture"
+        coop start "$INSTANCE" --no-agents >/dev/null 2>&1 || true
+        return
+    fi
+    if [[ ! -e "$instance_dir/firecracker.pid" \
+        && "$(stat -c '%U:%a' "$api_socket")" == root:755 \
+        && "$(stat -c '%U:%a' "$vsock_socket")" == root:755 ]]; then
+        pass "stopped legacy fixture has root-owned mode-0755 sockets and no PID"
+    else
+        fail "stopped legacy fixture has root-owned mode-0755 sockets and no PID"
+    fi
+    if coop status && grep -qE "^${INSTANCE}[[:space:]]+stopped" <<<"$HARNESS_OUT"; then
+        pass "bare status reports old stopped VM with stale sockets"
+    else
+        fail "bare status reports old stopped VM with stale sockets" \
+            "stderr: $HARNESS_ERR"
+    fi
+
+    if coop start "$INSTANCE" --no-agents; then
+        pass "untagged Firecracker instance starts over legacy TCP"
+        if [[ ! -e "$api_socket" && -S "$vsock_socket" ]]; then
+            pass "start removes stale API socket and replaces stale base vsock socket"
+        else
+            fail "start removes stale API socket and replaces stale base vsock socket"
+        fi
+    else
+        fail "untagged Firecracker instance starts over legacy TCP" "stderr: $HARNESS_ERR"
+    fi
+    if guest_exec systemctl is-active --quiet coop-vsock-ssh.socket; then
+        fail "untagged lifecycle keeps vsock unavailable" \
+            "vsock listener unexpectedly active"
+    else
+        pass "untagged lifecycle keeps vsock unavailable"
+    fi
+    local output=""
+    if output=$(guest_exec printf legacy-shell-ok) && [[ "$output" == "legacy-shell-ok" ]]; then
+        pass "shell works for untagged legacy Firecracker instance"
+    else
+        fail "shell works for untagged legacy Firecracker instance" \
+            "output: $output; stderr: $(guest_stderr)"
+    fi
+    if output=$(coop_exec printf legacy-exec-ok) && [[ "$output" == "legacy-exec-ok" ]]; then
+        pass "exec works for untagged legacy Firecracker instance"
+    else
+        fail "exec works for untagged legacy Firecracker instance" \
+            "output: $output; stderr: $(guest_stderr)"
+    fi
+    if ! guest_exec sudo systemctl enable coop-vsock-ssh.socket; then
+        fail "re-enable vsock listener after legacy compatibility proof" \
+            "stderr: $(guest_stderr)"
+    fi
+    if coop stop "$INSTANCE" && [[ "$(cksum "$state")" == "$state_before" ]]; then
+        pass "legacy lifecycle does not eagerly rewrite untagged instance state"
+    else
+        fail "legacy lifecycle does not eagerly rewrite untagged instance state" \
+            "stderr: $HARNESS_ERR"
+    fi
+
+    # Restore the suite's opt-in mode for all subsequent lifecycle phases.
+    python3 - "$state" <<'PYEOF'
+import json, os, sys
+path = sys.argv[1]
+with open(path) as f:
+    state = json.load(f)
+state["firecracker_control"] = "vsock"
+staging = path + ".vsock-test"
+with open(staging, "w") as f:
+    json.dump(state, f, indent=2)
+    f.write("\n")
+os.replace(staging, path)
+PYEOF
+    if coop start "$INSTANCE" --no-agents; then
+        pass "restore primary instance to vsock control mode"
+    else
+        fail "restore primary instance to vsock control mode" "stderr: $HARNESS_ERR"
+    fi
+}
+
 # ── Stop / status-stopped / restart ───────────────────────────
 
 test_stop_preserves_recent_writes() {
@@ -2767,14 +3196,20 @@ test_stop() {
             fail "guest address identifies stop TAP" "unexpected guest IPv4 address: $ip"
         fi
 
-        # Firecracker and its socket run as root. Kill the VMM without its
-        # graceful cleanup so `coop stop` must recognize the abandoned
-        # root-owned socket and still remove the TAP.
+        # Firecracker runs without an API socket. Its base vsock socket is
+        # mode 0666 so coop can connect through the user-owned mode-0700
+        # instance directory. Kill the VMM without graceful cleanup so
+        # `coop stop` must recognize and remove the abandoned socket.
         fc_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        instance_dir="$HOME/.coop/instances/$INSTANCE"
         socket_path="$HOME/.coop/instances/$INSTANCE/firecracker.socket"
-        socket_metadata=$(stat -c '%U:%a' "$socket_path" 2>/dev/null || true)
-        if [[ -n "$fc_pid" && -S "$socket_path" \
-            && "$socket_metadata" == "root:755" ]]; then
+        vsock_path="$HOME/.coop/instances/$INSTANCE/vsock.sock"
+        directory_metadata=$(stat -c '%U:%a' "$instance_dir" 2>/dev/null || true)
+        vsock_metadata=$(stat -c '%U:%a' "$vsock_path" 2>/dev/null || true)
+        if [[ -n "$fc_pid" && ! -e "$socket_path" && -S "$vsock_path" \
+            && "$directory_metadata" == "$(id -un):700" \
+            && "$vsock_metadata" == "root:666" ]]; then
+            pass "Firecracker has no API socket and contains vsock in the private instance directory"
             if sudo -n kill -9 "$fc_pid"; then
                 for _ in {1..50}; do
                     if ! sudo -n kill -0 "$fc_pid" 2>/dev/null; then
@@ -2783,18 +3218,18 @@ test_stop() {
                     fi
                     sleep 0.1
                 done
-                if [[ "$exited" -eq 1 && -S "$socket_path" ]]; then
-                    pass "unexpected Firecracker exit leaves a root-owned API socket"
+                if [[ "$exited" -eq 1 && -S "$vsock_path" ]]; then
+                    pass "unexpected Firecracker exit leaves a root-owned vsock socket"
                 else
-                    fail "unexpected Firecracker exit leaves a root-owned API socket" \
-                        "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$socket_path" ]] && echo yes || echo no )"
+                    fail "unexpected Firecracker exit leaves a root-owned vsock socket" \
+                        "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$vsock_path" ]] && echo yes || echo no )"
                 fi
             else
                 fail "simulate unexpected Firecracker exit" "could not kill PID $fc_pid"
             fi
         else
-            fail "Firecracker stop fixture has a root-owned mode-0755 socket" \
-                "pid=${fc_pid:-<missing>} socket=$socket_path metadata=${socket_metadata:-missing}"
+            fail "Firecracker stop fixture has no API and a private mode-0666 vsock socket" \
+                "pid=${fc_pid:-<missing>} dir=${directory_metadata:-missing} api=$( [[ -e "$socket_path" ]] && echo present || echo absent ) vsock=${vsock_metadata:-missing}"
         fi
     fi
 
@@ -2813,6 +3248,12 @@ test_stop() {
             fail "stop removes stale Firecracker PID file" "PID file still exists"
         else
             pass "stop removes stale Firecracker PID file"
+        fi
+        if [[ -e "$socket_path" || -e "$vsock_path" ]]; then
+            fail "stop removes stale Firecracker runtime sockets" \
+                "api=$( [[ -e "$socket_path" ]] && echo present || echo absent ) vsock=$( [[ -e "$vsock_path" ]] && echo present || echo absent )"
+        else
+            pass "stop removes stale Firecracker runtime sockets"
         fi
     fi
 }
@@ -2961,6 +3402,20 @@ test_resize_status() {
     fi
     pass "status shows disk before resize (${old_disk} GiB)"
 
+    if coop resize "$INSTANCE" --size 1GB; then
+        fail "resize rejects decimal GB suffix" "accepted 1GB"
+    elif [[ "$HARNESS_ERR" == *"invalid value '1GB'"* ]]; then
+        pass "resize rejects decimal GB suffix"
+    else
+        fail "resize rejects decimal GB suffix" "wrong failure: $HARNESS_ERR"
+    fi
+    if coop resize "$INSTANCE" --size "${old_disk}GiB"; then
+        pass "resize accepts explicit GiB suffix"
+    else
+        fail "resize accepts explicit GiB suffix" "stderr: $HARNESS_ERR"
+        return
+    fi
+
     # Resize by +1G while stopped
     if coop resize "$INSTANCE" --size +1G; then
         pass "resize +1G exits 0"
@@ -2982,6 +3437,57 @@ test_resize_status() {
         fi
     else
         fail "status after resize" "exit code: $?"
+    fi
+}
+
+test_resize_retry_firecracker() {
+    echo ""
+    echo "=== Phase: Firecracker disk resize retry ==="
+    if [[ $(uname -s) != Linux ]]; then
+        skip "Firecracker disk resize retry" "Linux only"
+        return
+    fi
+
+    local data_dir="$HOME/.coop"
+    local rootfs="$data_dir/instances/$INSTANCE/rootfs.ext4"
+    local current_bytes target_gib target_bytes before_bytes after_bytes
+    if ! current_bytes=$(stat -c %s "$rootfs"); then
+        fail "inspect Firecracker image before retry" "stat failed"
+        return
+    fi
+    target_gib=$((current_bytes / 1073741824 + 1))
+    target_bytes=$((target_gib * 1073741824))
+
+    # Leave the image at the target length without growing ext4, as a failed
+    # fsck or resize2fs would. The public retry must finish the work.
+    if ! sudo -n "$BINARY" __disk-op truncate "$data_dir" "$rootfs" "$target_gib"; then
+        fail "extend Firecracker image for retry" "privileged truncate failed"
+        return
+    fi
+    if ! before_bytes=$(sudo -n dumpe2fs -h "$rootfs" 2>/dev/null |
+        awk '/^Block count:/ { count = $3 } /^Block size:/ { size = $3 } END { if (!count || !size) exit 1; printf "%.0f", count * size }'); then
+        fail "inspect Firecracker filesystem before retry" "dumpe2fs failed"
+        return
+    fi
+    if [[ "$before_bytes" -ge "$target_bytes" ]]; then
+        fail "retry fixture has a smaller filesystem" "fs=$before_bytes image=$target_bytes"
+        return
+    fi
+
+    if ! coop resize "$INSTANCE" --size "${target_gib}GiB"; then
+        fail "same-size Firecracker resize retry exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if ! after_bytes=$(sudo -n dumpe2fs -h "$rootfs" 2>/dev/null |
+        awk '/^Block count:/ { count = $3 } /^Block size:/ { size = $3 } END { if (!count || !size) exit 1; printf "%.0f", count * size }'); then
+        fail "inspect Firecracker filesystem after retry" "dumpe2fs failed"
+        return
+    fi
+    if [[ "$after_bytes" == "$target_bytes" ]]; then
+        pass "same-size retry grows the ext4 filesystem"
+    else
+        fail "same-size retry grows the ext4 filesystem" \
+            "fs=$after_bytes image=$target_bytes"
     fi
 }
 
@@ -3063,6 +3569,14 @@ test_commit_restore() {
         if coop status "$INSTANCE" 2>/dev/null; then
             ip_before=$(echo "$HARNESS_OUT" | sed -n 's/.*Guest IP: \([0-9.][0-9.]*\).*/\1/p' | head -1)
         fi
+        if [[ "$(uname -s)" == Linux ]]; then
+            if guest_exec sudo systemctl disable coop-vsock-ssh.socket; then
+                pass "disable guest vsock listener before commit"
+            else
+                fail "disable guest vsock listener before commit" \
+                    "stderr: $(guest_stderr)"
+            fi
+        fi
         coop stop "$INSTANCE" >/dev/null 2>&1 || true
     else
         fail "start instance to seed sentinel" "could not start instance"
@@ -3083,6 +3597,20 @@ test_commit_restore() {
         fail "images lists committed image '$snap'" "output: $HARNESS_OUT"
     fi
 
+    # Firecracker commits snapshot a guest-mutable disk. The backend must
+    # restore its canonical vsock units before capability metadata is
+    # published; otherwise the disabled source above creates an image that
+    # passes validation but cannot boot in the suite's vsock mode. Restore the
+    # primary from that repaired image so its later lifecycle remains usable.
+    if [[ "$(uname -s)" == Linux ]]; then
+        if coop restore "$INSTANCE" --image "$snap"; then
+            pass "commit repairs disabled vsock listener before publishing image metadata"
+        else
+            fail "commit repairs disabled vsock listener before publishing image metadata" \
+                "stderr: $HARNESS_ERR"
+        fi
+    fi
+
     # Committing onto an existing name without --force is refused.
     if coop_fails commit "$INSTANCE" --image "$snap"; then
         pass "commit without --force refuses to overwrite"
@@ -3095,7 +3623,70 @@ test_commit_restore() {
         fail "commit without --force refuses to overwrite" "should have failed"
     fi
 
-    # --force overwrites the existing image.
+    # A failed forced commit must leave the old image and its capability
+    # metadata paired and usable. Make listener repair fail deterministically
+    # in the staged source by replacing the enablement directory with a file.
+    if [[ "$(uname -s)" == Linux ]]; then
+        local snap_disk="$HOME/.coop/images/$snap/rootfs-template.ext4"
+        local snap_metadata="$HOME/.coop/images/$snap/template-config.json"
+        local disk_before metadata_before
+        disk_before=$(stat -c '%d:%i:%s' "$snap_disk")
+        metadata_before=$(cksum "$snap_metadata")
+        if coop start "$INSTANCE" --no-agents >/dev/null 2>&1 \
+            && guest_exec sudo sh -c \
+                'rm -rf /etc/systemd/system/sockets.target.wants && : > /etc/systemd/system/sockets.target.wants' \
+            && coop stop "$INSTANCE" >/dev/null 2>&1; then
+            if coop_fails commit "$INSTANCE" --image "$snap" --force; then
+                pass "failed listener repair rejects forced commit"
+            else
+                fail "failed listener repair rejects forced commit" \
+                    "commit unexpectedly succeeded"
+            fi
+            if [[ "$(stat -c '%d:%i:%s' "$snap_disk")" == "$disk_before" ]] \
+                && [[ "$(cksum "$snap_metadata")" == "$metadata_before" ]]; then
+                pass "failed forced commit preserves prior disk and metadata"
+            else
+                fail "failed forced commit preserves prior disk and metadata" \
+                    "published image changed after repair failure"
+            fi
+            if coop restore "$INSTANCE" --image "$snap"; then
+                pass "prior image remains usable after failed forced commit"
+            else
+                fail "prior image remains usable after failed forced commit" \
+                    "stderr: $HARNESS_ERR"
+            fi
+        else
+            fail "create forced-commit repair failure fixture" \
+                "stderr: $(guest_stderr); coop: $HARNESS_ERR"
+        fi
+    fi
+
+    # Exercise the narrow publication window after the repaired disk swap but
+    # before metadata save. The incomplete marker must make both legacy and
+    # vsock consumers reject the otherwise-present disk until a retry repairs
+    # the image contract.
+    if [[ "$(uname -s)" == Linux ]]; then
+        local snap_metadata="$HOME/.coop/images/$snap/template-config.json"
+        local publication_marker="$HOME/.coop/images/$snap/.publication-incomplete"
+        if COOP_TEST_INJECT_COMMIT_METADATA_FAILURE=1 \
+            coop_fails commit "$INSTANCE" --image "$snap" --force; then
+            pass "post-swap metadata failure aborts forced commit"
+        else
+            fail "post-swap metadata failure aborts forced commit" \
+                "commit unexpectedly succeeded"
+        fi
+        if [[ -f "$snap_metadata" && -f "$publication_marker" ]] \
+            && coop_fails restore "$INSTANCE" --image "$snap" \
+            && grep -qi "incomplete publication" <<<"$HARNESS_ERR"; then
+            pass "incomplete publication cannot consume stale metadata"
+        else
+            fail "incomplete publication cannot consume stale metadata" \
+                "metadata or marker state is wrong; stderr: $HARNESS_ERR"
+        fi
+    fi
+
+    # --force overwrites the existing image and recovers an interrupted
+    # publication on Linux.
     if coop commit "$INSTANCE" --image "$snap" --force; then
         pass "commit --force overwrites existing image"
     else
@@ -3282,6 +3873,23 @@ test_restart_stopped() {
     echo ""
     echo "=== Phase: restart stopped instance ==="
 
+    # Seed a stopped Lima VM with a persisted graphical display so this test
+    # proves the restart path repairs it instead of preserving a headless value.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        local display=""
+        if limactl edit --tty=false --set '.video.display="default"' "coop-$INSTANCE" \
+                >/dev/null \
+            && display=$(lima_display) \
+            && [[ "$display" == "default" ]]; then
+            pass "restart fixture enables Lima display"
+        else
+            fail "restart fixture enables Lima display" \
+                "video.display=${display:-missing}"
+            echo "FATAL: could not prepare graphical Lima restart fixture"
+            exit 1
+        fi
+    fi
+
     # Restart the stopped instance (was stopped in previous phase)
     if coop start "$INSTANCE" --no-agents; then
         pass "restart stopped instance exits 0"
@@ -3291,6 +3899,7 @@ test_restart_stopped() {
         echo "FATAL: restart failed, cannot continue"
         exit 1
     fi
+    assert_lima_headless "after restart"
 
     # Verify it's running again
     if coop status "$INSTANCE"; then
@@ -3519,18 +4128,17 @@ test_restore_reprovision() {
     # test_ssh_config ran `--clean` long before this phase — so without this
     # the call is a no-op and nothing covers it.
     #
-    # Then deliberately break the block's Port. Relying on the port changing
-    # by itself only works on Lima (Firecracker's guest IP and port 22 are
-    # stable across stop/start), so on Firecracker an unrefreshed block would
-    # still connect and the assertion would pass without exercising anything.
-    # Pointing it at port 1 makes the post-reprovision connection succeed only
-    # if the refresh actually rewrote the block, on both backends.
+    # Then deliberately break the block's selected transport. Relying on an
+    # endpoint changing by itself only works on Lima; Firecracker's TCP and
+    # vsock endpoints are stable across stop/start. Pointing either the TCP
+    # Port or the ProxyCommand guest port at 1 makes the post-reprovision
+    # connection succeed only if refresh rewrites the block.
     local ssh_alias_seeded=""
     if coop ssh-config "$INSTANCE"; then
         ssh_alias_seeded=1
         pass "install coop-$INSTANCE alias before reprovision"
-        # Exits non-zero unless it actually rewrote a Port line inside this
-        # instance's block, so a marker-format change cannot leave the
+        # Exits non-zero unless it rewrote exactly one transport line inside
+        # this instance's block, so a marker-format change cannot leave the
         # assertion below silently vacuous.
         if python3 - "$HOME/.ssh/config" "coop-$INSTANCE" <<'PYEOF'
 import re, sys
@@ -3544,20 +4152,22 @@ for line in lines:
     elif line.strip() == "# coop END":
         inside = False
     elif inside:
-        line, n = re.subn(r"^(\s*)Port\s+\d+\s*$", r"\1Port 1", line.rstrip("\n"))
+        line = line.rstrip("\n")
+        line, port_n = re.subn(r"^(\s*)Port\s+\d+\s*$", r"\1Port 1", line)
+        line, proxy_n = re.subn(r"(--port)\s+\d+\s*$", r"\1 1", line)
         line += "\n"
-        staled += n
+        staled += port_n + proxy_n
     out.append(line)
 if staled != 1:
-    sys.exit(f"expected exactly one Port line in the {host} block, rewrote {staled}")
+    sys.exit(f"expected exactly one transport line in the {host} block, rewrote {staled}")
 with open(path, "w") as f:
     f.writelines(out)
 PYEOF
         then
-            pass "staled the coop-$INSTANCE alias port before reprovision"
+            pass "staled the coop-$INSTANCE alias transport before reprovision"
         else
-            fail "staled the coop-$INSTANCE alias port before reprovision" \
-                "could not rewrite the Port line; the assertion below would be vacuous"
+            fail "staled the coop-$INSTANCE alias transport before reprovision" \
+                "could not rewrite a transport line; the assertion below would be vacuous"
             ssh_alias_seeded=""
         fi
     else
@@ -3678,7 +4288,7 @@ PYEOF
     fi
 
     # A `coop resize --size` must survive the wipe: the image the disk is
-    # restored from is template-sized, so the reprovision has to re-grow it.
+    # restored from may be smaller, so the reprovision may have to re-grow it.
     local disk_after=""
     if coop status "$INSTANCE" 2>/dev/null; then
         disk_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
@@ -4316,6 +4926,16 @@ test_workspace_sync() {
     mkdir -p "$ws_tmpdir/subdir"
     echo "nested" > "$ws_tmpdir/subdir/nested.txt"
 
+    local excluded
+    mkdir -p "$ws_tmpdir/files" "$ws_tmpdir/links"
+    for excluded in node_modules target __pycache__ .venv .coop; do
+        mkdir -p "$ws_tmpdir/$excluded" "$ws_tmpdir/subdir/$excluded"
+        echo excluded > "$ws_tmpdir/$excluded/marker"
+        echo excluded > "$ws_tmpdir/subdir/$excluded/marker"
+        echo retained > "$ws_tmpdir/files/$excluded"
+        ln -s ../subdir "$ws_tmpdir/links/$excluded"
+    done
+
     # Initialise a git repo so the .git/ inclusion path (issue #91) is
     # exercised end-to-end. Use a local-only commit; no remote is set up.
     (
@@ -4338,6 +4958,15 @@ test_workspace_sync() {
     # Verify files were synced to guest
     local file_content
     GUEST_INSTANCE="$ws_instance"
+
+    if guest_exec sh -c 'for name in node_modules target __pycache__ .venv .coop; do
+        test ! -e "/workspace/$name" && test ! -e "/workspace/subdir/$name" &&
+        test -f "/workspace/files/$name" && test -L "/workspace/links/$name" || exit 1
+    done'; then
+        pass "initial copy applies directory-only rsync exclusions"
+    else
+        fail "initial copy applies directory-only rsync exclusions" "stderr: $(guest_stderr)"
+    fi
 
     if file_content=$(guest_exec cat /workspace/hello.txt); then
         if [[ "$file_content" == "workspace-test-content" ]]; then
@@ -4382,10 +5011,24 @@ test_workspace_sync() {
     coop_exec sh -c \
         'echo modified-in-guest > /workspace/hello.txt && git -C /workspace config core.fsmonitor ./guest-payload && mkdir -p /workspace/.GIT && echo guest-alias > /workspace/.GIT/config' || true
 
+    guest_exec sh -c 'for name in node_modules target __pycache__ .venv .coop; do
+        mkdir -p "/workspace/$name" "/workspace/subdir/$name" || exit 1
+        echo excluded > "/workspace/$name/marker" || exit 1
+    done' || fail "seed guest build directories" "stderr: $(guest_stderr)"
+
     local pull_dir
     pull_dir=$(mktemp -d)
     if coop pull "$ws_instance" --dir "$pull_dir"; then
         pass "pull into empty destination exits 0 without --force"
+
+        for excluded in node_modules target __pycache__ .venv .coop; do
+            if [[ ! -e "$pull_dir/$excluded" && ! -e "$pull_dir/subdir/$excluded" &&
+                  -f "$pull_dir/files/$excluded" && -L "$pull_dir/links/$excluded" ]]; then
+                pass "pull applies directory-only exclusion: $excluded"
+            else
+                fail "pull applies directory-only exclusion: $excluded" "unexpected copied entries"
+            fi
+        done
 
         local pulled
         pulled=$(cat "$pull_dir/hello.txt" 2>/dev/null)
@@ -4510,14 +5153,8 @@ EOF
     ws_tmpdir=""
 }
 
-# macOS hosts: `coop up --copy` streams the workspace through host tar, whose
-# default copyfile(3) metadata path emits AppleDouble `._*` sidecar entries
-# for xattrs/resource forks. Those land in the Linux guest as ordinary files;
-# entries inside .git can break Git's pack/ref discovery, while worktree
-# sidecars can be pulled back to the host. coop sets COPYFILE_DISABLE=1 on
-# host-side tar creation to suppress them; this phase reproduces the round-trip
-# and pins the fix.
-# Skipped off macOS, where tar has no copyfile path.
+# Copy/pull must not synthesize AppleDouble sidecars from macOS metadata.
+# Exercise xattr-bearing source files against the Linux guest.
 test_appledouble_sidecars() {
     echo ""
     echo "=== Phase: appledouble sidecars (macOS --copy round-trip) ==="
@@ -4560,8 +5197,6 @@ test_appledouble_sidecars() {
         return
     fi
 
-    # The push side is where host tar creation runs, so check the guest
-    # first: sidecars appearing here mean COPYFILE_DISABLE didn't apply.
     GUEST_INSTANCE="$ad_instance"
     if sidecars=$(coop_exec sh -c 'find /workspace -name "._*"'); then
         if [[ -z "$sidecars" ]]; then
@@ -7659,6 +8294,9 @@ main() {
     cat > "$SUITE_CONFIG" <<'EOF'
 [grok]
 config_dir = false
+
+[vm]
+firecracker_control = "vsock"
 EOF
 
     verify_binary
@@ -7684,6 +8322,7 @@ EOF
     test_running_vm_completions
     test_auto_resolve_running
     test_shell_connectivity
+    test_firecracker_vsock_transport
     test_ssh_alias
     test_ssh_config
     test_editor
@@ -7707,6 +8346,8 @@ EOF
     test_logs
     test_profiles
     test_guest_fingerprint
+    test_vsock_control_without_guest_network
+    test_legacy_firecracker_control_compatibility
 
     # Stop + restart + stopped-state verification
     test_stop_preserves_recent_writes
@@ -7718,6 +8359,7 @@ EOF
     test_list_stopped
     test_stopped_vm_completions
     test_resize_status
+    test_resize_retry_firecracker
     test_reconfigure
     test_commit_restore
     test_private_storage

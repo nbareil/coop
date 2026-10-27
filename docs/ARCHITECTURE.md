@@ -25,10 +25,12 @@ coop/
 │   ├── setup.rs            # Firecracker host setup + golden-image builder
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
-│   ├── workspace.rs        # workspace sync (rsync/tar) + ~/.ssh/config injection
+│   ├── workspace.rs        # workspace sync (rsync) + ~/.ssh/config injection
 │   ├── guest.rs            # guest profiles, required binaries, baked package lists
 │   ├── guest_env_state.rs  # persisted guest env vars
 │   ├── host_tool.rs        # typed trusted host-tool resolution + launch context
+│   ├── openssh.rs          # isolated coop-managed SSH/SCP/rsync boundary
+│   ├── vsock_proxy.rs      # bounded Firecracker CONNECT handshake + byte relay
 │   ├── proxy.rs            # host proxy processes and per-provider SSH reverse tunnels
 │   ├── proxy_state.rs      # persisted per-instance credential overrides
 │   ├── model_state.rs      # per-instance local/remote model routing
@@ -48,7 +50,7 @@ coop/
 │   ├── private_storage.rs  # managed state and disk permission repair
 │   ├── sha256_hash.rs      # Sha256Hash newtype
 │   ├── naming.rs           # safe-name character class
-│   ├── completions.rs      # shell completion (static + dynamic candidates)
+│   ├── completions.rs      # dynamic shell registration + candidates
 │   ├── prompt.rs           # TTY prompts
 │   ├── update.rs           # `coop update` self-update + background notifier
 │   └── commands/           # one module per command domain (see below)
@@ -92,9 +94,10 @@ code, it must hold for **both** backends. Known intentional divergences:
 | Aspect | Firecracker | Lima |
 |--------|-------------|------|
 | `guest_host_address` | TAP gateway (`network.host_ip`) | `host.lima.internal` |
-| `mounts_are_live` | `false` (one-time rsync/tar sync) | `true` (virtiofs) |
-| `ssh_target` | built from `guest_ip` + `ssh_port` | queried from `limactl` (per-boot forwarded port) |
-| workspace/mounts | rsync or tar-pipe over SSH | live mounts |
+| `mounts_are_live` | `false` (one-time rsync sync) | `true` (virtiofs) |
+| `ssh_target` | legacy TCP from `guest_ip` + `ssh_port`, or persisted vsock socket + guest port | queried from `limactl` (per-boot forwarded port) |
+| copied workspace (`--copy`) | one-time rsync over SSH | one-time rsync over SSH |
+| project and extra mounts | one-time rsync over SSH | live virtiofs mounts |
 
 ### Typestate invariants
 
@@ -115,6 +118,17 @@ flags — this is a load-bearing design choice (see
   check at the backend boundary. `boot_preflight(cfg)` then runs
   `cfg.validate()` before backend setup or boot work, so no VM starts on an
   invalid config.
+
+`backend::SshTarget` keeps backend identity separate from its closed transport
+choice. TCP targets carry a validated hostname and port. The Firecracker-vsock
+variant carries the trusted per-instance Unix-socket path and guest port, and
+renders the same Rust `__vsock-proxy` helper for SSH, SCP, rsync, forwarding,
+and generated SSH configuration. The helper bounds and validates Firecracker's
+text `CONNECT` handshake before relaying raw bytes. New Firecracker instances
+persist the configured `FirecrackerControlMode`; the opt-in `vsock` mode is
+then used for readiness, shutdown, and every shared SSH consumer. Older state
+without the tag maps to `LegacyTcp` in memory without an eager rewrite. Lima
+remains TCP-based.
 
 An instance operation lock is held from the stopped-state probe through disk
 resize, commit, or restore. Start, stop, and destroy acquire the same bounded
@@ -170,7 +184,7 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
    allowlisted config files and a managed `settings.json`, and on first boot
    install the *delta* of marketplaces/plugins/MCP servers not already baked
    into the golden image.
-6. **Workspace** — `--workspace` copies via tar-pipe; `--git-repo` clones inside
+6. **Workspace** — `--workspace` copies via rsync; `--git-repo` clones inside
    the guest; mounts are live on Lima and rsync'd on Firecracker. Persist
    `WorkspaceState`.
 7. **Creation hooks** — select a recipe before first boot and persist it in
@@ -212,15 +226,18 @@ trusted; existing healthy instances remain available through normal lookup.
 ## `coop update`
 
 `update.rs` self-updates the CLI and its proxy companion: fetch release metadata
-from the pinned `trailofbits/coop` repo, download the platform tarball + `SHA256SUMS` +
-`attestations.jsonl`, verify the checksum (mandatory), verify the Sigstore
+from the fixed `https://api.github.com/repos/trailofbits/coop/releases` source,
+validate the canonical release tag and exact GitHub identity of the platform
+tarball, `SHA256SUMS`, and optional `attestations.jsonl` before download, verify the checksum (mandatory), verify the Sigstore
 attestation via `gh` against that bundle, falling back to the attestations API
 when the release publishes no usable one (best-effort). Both paths pin the
 signer to `.github/workflows/release.yml` at the selected tag, require that
 source ref, and reject attestations generated on self-hosted runners. Then
 extract with path-escape-safe `tar` flags, and atomically `rename` the new
 `coop-proxy` beside the CLI before replacing `coop`. Each replacement is
-atomic; the pair is not a single transaction. A background notifier checks for
+atomic; the pair is not a single transaction. Official builds cannot replace
+the metadata origin at runtime. A separately compiled test policy permits only
+a loopback fixture for the host-only updater integration test. A background notifier checks for
 new versions on a 24-hour interval (disabled in dev/CI/non-TTY). The full verification chain and
 its trust properties are documented in [`trust-model.md`](trust-model.md#coop-update-trust-chain).
 

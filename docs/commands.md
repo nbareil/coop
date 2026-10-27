@@ -748,17 +748,26 @@ coop resize [NAME] [--size <SIZE>] [--mem <MIB>] [--vcpus <N>] [--start]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--size <size>` | New disk size. Absolute: `150` or `150G`. Relative: `+20` or `+20G`. |
+| `--size <size>` | New disk size in GiB. Absolute: `150`, `150G`, or `150GiB`. Relative: `+20`, `+20G`, or `+20GiB`. |
 | `--mem <mib>` | New memory in MiB (minimum 128). |
 | `--vcpus <n>` | New vCPU count (> 0). |
 | `--start` | Start the instance after applying the change instead of leaving it stopped. |
 
 Absolute disk values set the disk to that exact size; a `+` prefix adds to the
-current size. Memory and vCPU changes are written to the instance's backend
-config (the Firecracker per-instance JSON or the Lima `lima.yaml`), which is
-authoritative — the value survives restarts and is reported by `coop status`.
+current size rounded up to whole GiB. For example, `+1` on a 1 GiB + 4 KiB
+image targets 3 GiB. An absolute `1GiB` target for that image is rejected as
+a shrink, and the error includes both binary-unit context and exact bytes.
+See the [size-unit convention](configuration.md#size-units) for all accepted
+suffixes and the JSON unit contract. Memory and vCPU changes are written to
+the instance's backend config (the Firecracker per-instance JSON or the Lima
+`lima.yaml`). That config is authoritative: the value survives restarts and is
+reported by `coop status`.
 The global `[vm]` settings in `config.toml` only seed these values for *new*
 instances.
+
+On Firecracker, retry an interrupted disk resize with the same absolute
+`--size` while the instance is stopped. The retry checks and grows the ext4
+filesystem even if the image file already has the requested length.
 
 By default the instance is left stopped and the change takes effect on the next
 `coop start`. Pass `--start` to boot it immediately. On Firecracker, if a
@@ -849,7 +858,7 @@ Kept across the wipe, because coop persists them host-side:
 |---------|----------------|
 | Name, index, guest IP | `instance.json` |
 | Image | `instance.json` (updated when `--image` is given) |
-| Disk size | read before the swap and re-grown after it, since the image's disk is template-sized |
+| Disk size | exact byte length read before the swap; if the replacement is smaller, it is re-grown to the previous size rounded up to GiB |
 | vCPUs and memory | backend VM config, which the swap does not touch |
 | Workspace association (copy, git clone, or mount) | `workspace.json` |
 | Port forwards | `forwards.json` |
@@ -910,6 +919,10 @@ coop profiles show rust
 ### `update`
 
 Replace the running coop binary with a release from `github.com/trailofbits/coop`. Downloads the tarball matching the current host triple, verifies its SHA-256 against the release's `SHA256SUMS`, and (when `gh` is installed) verifies the GitHub build-provenance attestation before swapping the binary atomically.
+Official builds fetch metadata for the compiled `trailofbits/coop` repository
+from GitHub and validate the selected tag plus the exact repository, tag, and
+filename identity of the archive, checksum file, and optional attestation bundle
+before downloading any asset. The update source is not runtime-configurable.
 Attestation verification requires `.github/workflows/release.yml` at the selected
 release tag and rejects attestations generated on self-hosted runners. The same
 policy applies to the release bundle and GitHub API fallback.
@@ -975,7 +988,7 @@ coop uninstall --yes --purge         # CI: remove binary and data, explicit
 
 ### `completions`
 
-Print a static shell completion script. Pair with `source <(COMPLETE=<shell> coop)` in your shell rc for dynamic completion of live instance, image, and profile names. See [docs/shell-completion.md](shell-completion.md) for full setup recipes per shell.
+Print a dynamic shell completion script, including live instance, image, and profile names. Regenerate saved scripts after upgrading coop. See [docs/shell-completion.md](shell-completion.md) for full setup recipes per shell.
 
 ```
 coop completions <SHELL>
@@ -1037,7 +1050,7 @@ for precedence, opt-out, conflicts, rotation, and bootstrap timing.
 Manage the host-side credential-injecting proxy. When a `[proxy.<provider>]`
 upstream is configured, coop runs a `coop-proxy` process on the host for the
 lifetime of each remote-mode VM: the guest is pointed at the proxy and holds
-only a per-instance capability token, while the real API key stays on the host
+only a per-instance capability token, while the real credential stays on the host
 and is injected onto outbound requests the guest never sees. Applies only in
 remote model mode (`coop model <vm> remote`); local mode takes precedence. See
 the [credential proxy guide](credential-proxy.md) and the
@@ -1046,12 +1059,13 @@ model.
 
 | Subcommand | Effect |
 |------------|--------|
-| `setup [--anthropic] [--openai] [--vm <name>] [--api-key]` | Store a provider credential in a secret backend and wire it into `[proxy.<provider>]` (the default) or a per-VM override. Anthropic (Claude) is the default provider; pass `--openai` for Codex. `--vm <name>` stores the credential as a per-VM override in that instance's state instead of the global default. Anthropic only: `--api-key` stores an API key (`x-api-key`) instead of a Claude `setup-token`; ignored for `--openai`, whose keys are always injected as `Authorization: Bearer`. |
+| `setup [--anthropic] [--openai] [--vm <name>] [--api-key] [--codex-access-token]` | Store a provider credential in a secret backend and wire it into `[proxy.<provider>]` (the default) or a per-VM override. Anthropic is the default; `--api-key` stores an API key instead of a Claude setup token. `--openai` stores a Platform API key, or add `--codex-access-token` to validate and store a Codex workspace PAT (`at-...`) using workspace entitlements. `--codex-access-token` requires `--openai` and conflicts with `--api-key`. `--vm <name>` selects a per-VM override. |
 | `status [--vm <name>]` | Show what each VM's agents resolve to (per-VM override → default → off), with credentials redacted. Pass `--vm <name>` for the effective resolution of a single VM instead of all. |
 
 ```
 coop proxy setup
 coop proxy setup --openai
+coop proxy setup --openai --codex-access-token
 coop proxy setup --vm my-project
 coop proxy setup --api-key
 coop proxy status

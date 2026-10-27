@@ -17,7 +17,7 @@ coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. O
 - x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but untested)
 - `sudo` privileges (Firecracker uses jailer and TAP networking)
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
-- Setup also checks for `setfacl`, `unsquashfs`, `ssh`, and `rsync`. Automatic installation of missing tools requires `apt-get`; on other hosts, install the packages providing the reported tools manually and rerun `coop setup`. See [backend prerequisites](backends.md#prerequisites-1).
+- Setup also checks for `setfacl` and `unsquashfs` on `PATH`, plus trusted resolved `ssh`, `scp`, and `rsync` clients. Automatic installation of missing tools requires `apt-get`; on non-FHS hosts, configure exact OpenSSH/rsync paths under `[ssh.host_tools]`. See [backend prerequisites](backends.md#prerequisites-1).
 
 ## Install
 
@@ -31,7 +31,9 @@ curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | 
 `SHA256SUMS` and, when the [GitHub CLI](https://cli.github.com/) is installed,
 also verifies its Sigstore build-provenance attestation. `coop update` runs the
 same verification, except that it treats the checksum as mandatory and refuses
-to install without it. To verify a tarball by hand, download
+to install without it. Official `coop update` builds also fix metadata lookup to
+the `trailofbits/coop` GitHub repository and validate the expected release tag
+and exact asset identities before downloading them. To verify a tarball by hand, download
 `attestations.jsonl` from the same release and pass `--bundle` (this needs no
 GitHub credential — releases up to v0.5.4 predate the bundle asset and do
 not publish it):

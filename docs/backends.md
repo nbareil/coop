@@ -51,6 +51,57 @@ Memory and vCPU changes rewrite the `cpus`/`memory` fields in the instance's `li
 
 Lima runs as the current user. No `sudo` is required for any Lima operation: setup, start, stop, or destroy.
 
+### SSH resets or times out while Lima says Running
+
+If a coop command fails with `kex_exchange_identification: read: Connection reset by peer`, or `coop start` times out waiting for SSH, inspect the Lima messages too. A repeated `tcpproxy: error dialing "<guest-ip>:22": ... no route to host` and/or an unavailable vsock guest agent can occur while `limactl list` still says `Running`. That state describes the VZ process, not a completed guest boot or a working SSH server. The address in the message is diagnostic; do not assume it stays the same.
+
+Try the less invasive recovery steps first:
+
+```sh
+coop stop <instance>
+coop start <instance>
+```
+
+Check the host's VPN and network state. If several VZ guests or host networking are affected, reboot macOS and retry. Do not start recovery by running `coop destroy`: it deletes the instance disk. If the same SSH and guest-agent errors persist, they may be symptoms of a guest boot or filesystem failure rather than a host network problem. `coop logs <instance>` and Lima's logs under the instance directory may show where boot stopped.
+
+To inspect the VZ console, stop the instance, enable Lima video output, then start it directly:
+
+```sh
+coop stop <instance>
+limactl edit --tty=false --video coop-<instance>
+limactl start coop-<instance>
+```
+
+The display may show an initramfs prompt asking for a manual `fsck`. Follow the device named by the boot message only after confirming it is the root filesystem and is not mounted. If console repair is unavailable, use the offline procedure below. After diagnosis, stop the VM before touching its disk; `limactl edit --tty=false --video=false coop-<instance>` restores the usual headless display while it is stopped.
+
+#### Offline filesystem repair on macOS
+
+**Never run host-side `fsck` or `e2fsck` on an instance disk while its VM is running.** Filesystem repair changes guest data and can lose damaged files. Keep a separate backup so you can recover the pre-repair disk.
+
+**Host-side repair crosses coop's VM isolation boundary.** The guest disk is untrusted. Attaching it causes macOS to parse guest-controlled partition metadata, and the commands below run `debugfs` and `e2fsck` as root on guest-controlled filesystem metadata. A maliciously crafted or corrupted disk could exploit a vulnerability in those host parsers and compromise the host. The safer option is to perform the diagnosis and repair inside a disposable VM that has access only to the stopped instance disk; configuring such a helper VM is outside the scope of this guide. Proceed with the host-side steps only if you accept this risk.
+
+1. Run `coop stop <instance>` and check `limactl list` until `coop-<instance>` is `Stopped`. If a broken VZ process does not stop gracefully, `limactl stop -f coop-<instance>` is a last resort: it kills the VM without a clean guest shutdown and may add filesystem damage. Confirm `Stopped` again before continuing.
+2. Locate the instance directory at `${LIMA_HOME:-$HOME/.lima}/coop-<instance>`. Identify the instance's disk there; Lima versions use `disk` or `diffdisk`, and `disk` may be a symlink to `diffdisk`. Resolve the path to the actual file, assign that absolute path to `disk_image`, and print it for confirmation. Verify that it is inside the selected instance directory and is not the golden image or another instance's disk. Copy it to a **separate backup location** with enough free space, for example:
+
+   ```sh
+   disk_image="/absolute/path/to/coop-INSTANCE/diffdisk"
+   backup_image="/separate/backup/location/diffdisk.pre-fsck-YYYYMMDDTHHMMSS"
+   printf 'Instance disk: %s\n' "$disk_image"
+   if [ -e "$backup_image" ]; then
+       printf 'Backup already exists: %s\n' "$backup_image" >&2
+   else
+       cp -p "$disk_image" "$backup_image"
+   fi
+   ```
+
+   Replace both example paths, choose a new backup path, then verify that the copy completed.
+3. Install `e2fsprogs` (`brew install e2fsprogs`). Attach the stopped raw instance disk read-only with `hdiutil attach -nomount -readonly -imagekey diskimage-class=CRawDiskImage "$disk_image"`. Note the whole-disk device reported by `hdiutil`, then run `diskutil list /dev/diskN` (replace `diskN` with that device). Identify the Linux ext4 **root partition** from the partition map; do not assume a partition number. If more than one ext4 partition exists, inspect each candidate with `sudo "$(brew --prefix e2fsprogs)/sbin/debugfs" -R 'stat /etc' /dev/rdiskNsY` and use the one containing the guest root directory. Do not select an EFI, swap, or data partition. If you cannot identify the root partition confidently, detach `/dev/diskN` and stop.
+4. Run a read-only diagnostic on the confirmed root partition: `sudo "$(brew --prefix e2fsprogs)/sbin/e2fsck" -fn /dev/rdiskNsY`. Replace `rdiskNsY` with the partition you identified, and record the findings and exact exit status. Status `0` means no filesystem errors were found; detach `/dev/diskN` and do not run the repair pass. Exact status `4` means errors remain uncorrected and you may continue to step 5. Any other or combined status indicates a different failure; detach `/dev/diskN` and investigate instead of attempting repair.
+5. Detach the disk with `hdiutil detach /dev/diskN`, then attach the same image for writing with `hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$disk_image"`. **Read the new device name and partition map again**; macOS may assign a different `diskN`. Confirm the root partition again, then run `sudo "$(brew --prefix e2fsprogs)/sbin/e2fsck" -fy /dev/rdiskNsY` on that partition only. Exit status `1` means errors were corrected; `0` means no errors were found. For any other exit status or unresolved error, detach `/dev/diskN` before stopping to investigate.
+6. Run `sudo "$(brew --prefix e2fsprogs)/sbin/e2fsck" -fn /dev/rdiskNsY` again, record its result, and detach with `hdiutil detach /dev/diskN` regardless of the result. Run `coop start <instance>` and verify SSH works only if the final check was clean and returned exit status `0`.
+
+Keep the backup until the guest boots and its files are checked. If `hdiutil` cannot attach the disk, stop. If a later step fails, detach any attached disk before stopping; never boot or retry the instance while its disk remains attached to the host.
+
 ## Linux / Firecracker
 
 The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.github.io/) with KVM hardware virtualization. Each instance is a lightweight VM with its own rootfs, TAP network device, and Firecracker process.
@@ -60,7 +111,7 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 - **KVM access**: `/dev/kvm` must exist and be readable/writable by the current user. Setup checks this and offers to fix permissions via `setfacl` or by adding the user to the `kvm` group.
 - **x86_64 or arm64 architecture**: The Firecracker backend supports both. x86_64 is the primary test target; arm64 builds are produced but less exercised.
 - **curl**: Required for downloading the Firecracker binary and kernel.
-- **System packages**: Setup checks for `setfacl`, `unsquashfs`, `mkfs.ext4`, `ssh`, and `rsync`. If tools are missing, it offers to install their Debian/Ubuntu packages (`acl`, `squashfs-tools`, `e2fsprogs`, `openssh-client`, and `rsync`) using `apt-get`. If `apt-get` is unavailable, setup lists the missing tools; install the packages providing them with your host's package manager and rerun `coop setup`. No package manager is needed for this check when all these tools are already on `PATH`. The guest remains Ubuntu regardless of the host distribution.
+- **System packages**: Setup checks for `setfacl`, `unsquashfs`, and `mkfs.ext4` on `PATH`, plus trusted resolved `ssh`, `scp`, and `rsync` clients. If tools are missing, it offers to install their Debian/Ubuntu packages (`acl`, `squashfs-tools`, `e2fsprogs`, `openssh-client`, and `rsync`) using `apt-get`. Non-FHS OpenSSH/rsync installations can be selected with `[ssh.host_tools]`; see [configuration](configuration.md#ssh-section). If `apt-get` is unavailable, setup lists the missing tools; install or configure the tools and rerun `coop setup`. The guest remains Ubuntu regardless of the host distribution.
 - **Network control-plane tools**: `sudo`, `ip`, `bridge`, `iptables`, and
   `sysctl` use validated absolute system paths. Non-FHS hosts can provide exact
   per-tool paths under `[network.host_tools]`; see
@@ -72,7 +123,7 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 
 1. **Firecracker binary**: Downloaded from the latest GitHub release and stored in the data directory. The jailer binary is extracted alongside it.
 2. **Guest kernel**: Fetched from Firecracker's CI S3 bucket. This is a minimal `vmlinux` image matching the Firecracker release version.
-3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, Grok Build, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd.
+3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, Grok Build, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd plus a socket-activated AF_VSOCK listener that forwards to loopback SSH. Newly created instances persist `[vm].firecracker_control`; `vsock` is opt-in, while existing and untagged instances retain `legacy_tcp`. Image metadata records whether the listener is present, so selecting or restoring an older image in vsock mode fails before disk or instance state is changed and tells the user to rebuild it. Because committed disks contain guest-authored state, Firecracker commit repairs and verifies a staging disk before publishing fresh capability metadata. Both setup and commit mark publication incomplete before replacing the live disk; the marker prevents consumers from using mismatched disk and metadata. Plain `coop setup --image X` refuses an image with this marker. Retry an interrupted commit from its source instance with `coop commit --image X --force`, or explicitly rebuild an interrupted base image with `coop setup --image X --rebuild`. A Firecracker image with metadata lacking the vsock listener capability needs explicit `--rebuild` even if its recipe hashes differ. Rebuilding a committed checkpoint discards its contents.
 
 All three steps are idempotent. If the artifact already exists and is up to date, setup skips it.
 
@@ -85,7 +136,7 @@ Creating an instance (`coop up`) follows this sequence:
 3. Optionally resizes the rootfs if a larger disk was requested (truncate + e2fsck + resize2fs).
 4. Writes a Firecracker JSON config specifying the kernel, rootfs drive, vCPU/memory allocation, network interface, and vsock device.
 5. Creates and attaches a TAP device to the bridge (see TAP networking below).
-6. Starts the Firecracker process with `sudo`. Firecracker requires root for KVM and TAP access.
+6. Starts the Firecracker process with `sudo` and `--no-api`. Firecracker requires root for KVM and TAP access; coop does not expose its control API socket.
 7. Records the Firecracker PID and waits for SSH to become reachable.
 8. If `--mount` was specified, rsyncs the host directory into the guest. This
    is a one-time copy, not a live mount. Use `coop push` to update the guest;
@@ -132,7 +183,7 @@ These settings are ignored on macOS. Lima handles its own networking. coop's gen
 
 ### Resize (disk, memory, vCPUs)
 
-Resizing a stopped Firecracker instance's disk runs `truncate` to extend the rootfs image, then `e2fsck -fy` and `resize2fs` to grow the filesystem in place. Shrinking is not supported.
+Resizing a stopped Firecracker instance's disk extends the rootfs image if needed, then runs `e2fsck -fy` and `resize2fs` to grow the filesystem in place. Retrying the same absolute size resumes an interrupted filesystem resize when the filesystem is repairable; it also checks a fully grown filesystem. Shrinking is not supported.
 
 Memory and vCPU changes edit the `machine-config` block of the instance's per-instance JSON (`vm_config.json`), written atomically so a crash mid-write leaves the prior values intact. This JSON is authoritative: on every restart `configure()` regenerates the infra fields (kernel path, boot args, drive, network) from the global config so they roll forward, but preserves the on-disk `mem_size_mib`/`vcpu_count` rather than resetting them to the global `[vm]` defaults. Those defaults therefore only seed *new* instances. Firecracker does not boot the VM to apply the change; it takes effect on the next `coop start` (or immediately with `--start`).
 
@@ -149,7 +200,13 @@ Firecracker requires `sudo` for several operations:
 
 ## Cross-compilation
 
-coop supports cross-compiling from macOS (arm64) to Linux (x86_64) for the Firecracker backend. The project includes a Cargo config that sets the linker for `x86_64-unknown-linux-musl` to `x86_64-linux-musl-gcc`, provided by the `musl-cross` Homebrew package.
+coop supports cross-compiling from macOS to Linux for the Firecracker backend.
+The project includes Cargo linker configuration for both release targets:
+`x86_64-unknown-linux-musl` uses `x86_64-linux-musl-gcc`, and
+`aarch64-unknown-linux-musl` uses `aarch64-linux-musl-gcc`. The matching cross
+compiler must be installed and available on `PATH`; see
+[`RELEASING.md`](../RELEASING.md) for the target-scoped compiler and linker
+variables used by the release preflight.
 
 The integration test runner (`tests/run-integration.sh --remote`) automates this workflow: it cross-compiles a release build, copies the binary to the remote Linux host via scp, and runs the test suite there.
 
@@ -168,8 +225,8 @@ the intentional setup and mount differences listed below:
 | `coop destroy` | `limactl delete --force` | Kill process, remove TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |
 | `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |
-| `coop shell` | SSH to localhost on Lima-assigned port | SSH to guest IP on configured port |
-| `coop resize` | Disk: truncates Lima disk and updates `lima.yaml` `disk:`. Mem/vCPU: edits `lima.yaml`, validated via start | Disk: truncates + resize2fs on rootfs. Mem/vCPU: edits per-instance JSON |
+| `coop shell` | SSH to localhost on Lima-assigned port | SSH over the instance's persisted control mode: guest IP for `legacy_tcp`, Firecracker vsock ProxyCommand for `vsock` |
+| `coop resize` | Disk: truncates Lima disk and updates `lima.yaml` `disk:`. Mem/vCPU: edits `lima.yaml`, validated via start | Disk: extends rootfs image if needed, then runs fsck + resize2fs. Mem/vCPU: edits per-instance JSON |
 | Resource monitoring | SSH query to guest | SSH query to guest |
 | Docker in guest | Works (full kernel) | Works (with iptables-legacy workaround) |
 | `--mount` host mounts | Live virtiofs (changes visible immediately) | One-time rsync sync (use `push`/`pull` to re-sync) |

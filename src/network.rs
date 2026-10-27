@@ -981,12 +981,12 @@ mod tests {
 
     #[test]
     fn setup_resolves_every_tool_before_running_the_first_probe() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let anchor = temp.path().join("root");
         let bin = anchor.join("usr/bin");
         let markers = temp.path().join("markers");
-        fs::create_dir_all(&bin).unwrap();
-        fs::create_dir(&markers).unwrap();
+        crate::test_support::create_private_dir_all(&bin).unwrap();
+        crate::test_support::create_private_dir_all(&markers).unwrap();
         for name in ["sudo", "ip", "bridge", "iptables"] {
             let executable = bin.join(name);
             fs::write(
@@ -1007,6 +1007,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: temp.path().join("instance"),
             image: default_image_name(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let error = setup_tap_with_policy(&cfg, &inst, &policy, |tool| vec![bin.join(tool.name())])
             .unwrap_err();
@@ -1016,10 +1017,10 @@ mod tests {
 
     #[test]
     fn configured_exact_path_replaces_builtin_candidates_without_fallback() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let anchor = temp.path().join("root");
         let bin = anchor.join("usr/bin");
-        fs::create_dir_all(&bin).unwrap();
+        crate::test_support::create_private_dir_all(&bin).unwrap();
         for name in ["sudo", "ip", "bridge", "iptables", "sysctl"] {
             let executable = bin.join(name);
             fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
@@ -1049,14 +1050,14 @@ mod tests {
 
     #[test]
     fn configured_paths_can_select_trusted_non_fhs_targets() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let anchor = temp.path().join("root");
         let bin = anchor.join("usr/bin");
         let profile = anchor.join("run/current-system/sw/bin");
         let wrappers = anchor.join("run/wrappers/bin");
-        fs::create_dir_all(&bin).unwrap();
-        fs::create_dir_all(&profile).unwrap();
-        fs::create_dir_all(&wrappers).unwrap();
+        crate::test_support::create_private_dir_all(&bin).unwrap();
+        crate::test_support::create_private_dir_all(&profile).unwrap();
+        crate::test_support::create_private_dir_all(&wrappers).unwrap();
         for name in ["ip", "bridge", "iptables", "sysctl"] {
             let executable = profile.join(name);
             fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
@@ -1089,18 +1090,19 @@ mod tests {
 
     #[test]
     fn teardown_tap_uses_configured_exact_ip_and_sudo_paths() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let anchor = temp.path().join("root");
         let profile = anchor.join("run/current-system/sw/bin");
         let wrappers = anchor.join("run/wrappers/bin");
-        fs::create_dir_all(&profile).unwrap();
-        fs::create_dir_all(&wrappers).unwrap();
+        crate::test_support::create_private_dir_all(&profile).unwrap();
+        crate::test_support::create_private_dir_all(&wrappers).unwrap();
         let marker = temp.path().join("runs");
         let inst = Instance {
             name: InstanceName::new("exact-cleanup").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             dir: temp.path().join("instance"),
             image: default_image_name(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let tap = inst.tap_device();
 
@@ -1151,10 +1153,10 @@ mod tests {
 
     #[test]
     fn teardown_tap_does_not_require_sudo_when_nothing_needs_mutation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let anchor = temp.path().join("root");
         let profile = anchor.join("run/current-system/sw/bin");
-        fs::create_dir_all(&profile).unwrap();
+        crate::test_support::create_private_dir_all(&profile).unwrap();
         let marker = temp.path().join("ip-probes");
         let ip = profile.join("ip");
         fs::write(
@@ -1183,6 +1185,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: temp.path().join("instance"),
             image: default_image_name(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
 
         teardown_tap_with_policy(&cfg, &inst, &policy, |_| Vec::new()).unwrap();
@@ -1192,10 +1195,10 @@ mod tests {
 
     #[test]
     fn teardown_all_keeps_firewall_cleanup_when_ip_is_unavailable() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let anchor = temp.path().join("root");
         let bin = anchor.join("usr/bin");
-        fs::create_dir_all(&bin).unwrap();
+        crate::test_support::create_private_dir_all(&bin).unwrap();
         let marker = temp.path().join("iptables-runs");
 
         let sudo = bin.join("sudo");
@@ -1219,12 +1222,12 @@ mod tests {
 
     #[test]
     fn teardown_exact_ip_failure_does_not_suppress_exact_iptables_cleanup() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let anchor = temp.path().join("root");
         let bin = anchor.join("usr/bin");
         let profile = anchor.join("run/current-system/sw/bin");
-        fs::create_dir_all(&bin).unwrap();
-        fs::create_dir_all(&profile).unwrap();
+        crate::test_support::create_private_dir_all(&bin).unwrap();
+        crate::test_support::create_private_dir_all(&profile).unwrap();
         let marker = temp.path().join("iptables-runs");
 
         let sudo = bin.join("sudo");

@@ -7,6 +7,7 @@
 
 mod backend;
 mod cmd;
+mod codex_token;
 mod commands;
 mod completions;
 pub mod config;
@@ -22,6 +23,7 @@ pub mod guest_files;
 mod host_tool;
 mod model_state;
 mod naming;
+mod openssh;
 mod pat_prompt;
 mod paths;
 mod port_forward;
@@ -59,9 +61,13 @@ mod signal;
 mod setup;
 mod shell;
 mod ssh;
+#[cfg(test)]
+mod test_support;
 mod update;
+mod update_policy;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod vm;
+mod vsock_proxy;
 mod workspace;
 
 use std::path::PathBuf;
@@ -100,7 +106,15 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Internal privileged Firecracker API socket liveness probe.
+    /// Internal OpenSSH `ProxyCommand` for Firecracker vsock.
+    #[command(name = "__vsock-proxy", hide = true)]
+    VsockProxy {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        port: std::num::NonZeroU32,
+    },
+    /// Internal privileged Firecracker socket liveness probe.
     #[cfg(target_os = "linux")]
     #[command(name = "__probe-firecracker-socket", hide = true)]
     ProbeFirecrackerSocket { path: PathBuf },
@@ -121,6 +135,10 @@ enum Commands {
         hostname: String,
         ip: std::net::Ipv4Addr,
     },
+    /// Internal privileged repair for a committed Firecracker rootfs.
+    #[cfg(target_os = "linux")]
+    #[command(name = "__patch-guest-vsock-listener", hide = true)]
+    PatchGuestVsockListener { mount: PathBuf },
 
     /// Ensure an environment for a project directory exists and is running.
     ///
@@ -150,10 +168,10 @@ enum Commands {
         /// Number of vCPUs (overrides config when creating a new instance)
         #[arg(long)]
         vcpus: Option<u8>,
-        /// Memory in MiB (overrides config when creating a new instance)
+        /// Memory in MiB, bare or with MiB suffix (overrides config for a new instance)
         #[arg(long, value_parser = config::VmMemory::parse_cli)]
         mem: Option<config::VmMemory>,
-        /// Instance disk size in GiB (only used when creating a new instance)
+        /// Instance disk in GiB: bare, G/g, or GiB (new instances only)
         #[arg(long, value_parser = config::GiB::parse_cli)]
         disk: Option<config::GiB>,
         /// Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM
@@ -220,7 +238,7 @@ enum Commands {
         /// Number of vCPUs (overrides config)
         #[arg(long)]
         vcpus: Option<u8>,
-        /// Memory in MiB (overrides config)
+        /// Memory in MiB, bare or with MiB suffix (overrides config)
         #[arg(long, value_parser = config::VmMemory::parse_cli)]
         mem: Option<config::VmMemory>,
         /// Force rebuild of template rootfs
@@ -239,7 +257,7 @@ enum Commands {
         /// Path to a post-install script to run in the chroot (Linux/Firecracker only)
         #[arg(long)]
         post_install: Option<String>,
-        /// Template rootfs size in GiB (default: 8)
+        /// Template rootfs size in GiB: bare, G/g, or GiB (default: 8)
         #[arg(long, value_parser = config::GiB::parse_cli)]
         template_size: Option<config::GiB>,
         /// Named image to build (default: "default")
@@ -553,10 +571,10 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// New disk size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
+        /// New disk in GiB: absolute (150, 150G, 150GiB) or relative (+20, +20G, +20GiB)
         #[arg(long, value_parser = config::DiskSize::parse)]
         size: Option<config::DiskSize>,
-        /// New memory in MiB (minimum 128)
+        /// New memory in MiB, bare or with MiB suffix (minimum 128)
         #[arg(long, value_parser = config::VmMemory::parse_cli)]
         mem: Option<config::VmMemory>,
         /// New vCPU count
@@ -695,12 +713,12 @@ Examples:
   # fish — user
   coop completions fish > ~/.config/fish/completions/coop.fish
 
-Dynamic completion (live instance / image / profile names) requires one
-extra line in your shell rc:
+All scripts include live instance / image / profile names. Regenerate saved
+scripts after upgrading coop. Alternatively, generate them on shell startup:
 
-  bash:  source <(COMPLETE=bash coop)
-  zsh:   source <(COMPLETE=zsh coop)
-  fish:  source (COMPLETE=fish coop | psub)
+  bash:  source /dev/stdin <<<\"$(coop completions bash)\"
+  zsh:   source <(coop completions zsh)  # after compinit
+  fish:  coop completions fish | source
 ";
 
 #[derive(Subcommand)]
@@ -855,6 +873,10 @@ enum ProxyAction {
         /// `setup-token`. Ignored for `--openai` (always Bearer).
         #[arg(long)]
         api_key: bool,
+        /// `OpenAI` only: use a Codex-scoped workspace access token and its
+        /// `ChatGPT` plan entitlements instead of a Platform API key.
+        #[arg(long, requires = "openai", conflicts_with_all = ["api_key", "anthropic"])]
+        codex_access_token: bool,
     },
     /// Show what each VM's agents resolve to (per-VM override → default → off),
     /// with credentials redacted.
@@ -938,9 +960,13 @@ pub fn run() -> Result<()> {
     validate_pre_config_command_inputs(&cli.command, setup::PLATFORM_EXPLICIT_SETUP_INPUT_SUPPORT)?;
     init_tracing(cli.verbose);
 
+    if let Commands::VsockProxy { ref socket, port } = cli.command {
+        return vsock_proxy::run(socket, port);
+    }
+
     #[cfg(target_os = "linux")]
     if let Commands::ProbeFirecrackerSocket { ref path } = cli.command {
-        return config::probe_firecracker_api_socket(path);
+        return config::probe_firecracker_socket(path);
     }
 
     #[cfg(target_os = "linux")]
@@ -964,8 +990,13 @@ pub fn run() -> Result<()> {
         return setup::patch_guest_network_files(mount, hostname, ip);
     }
 
+    #[cfg(target_os = "linux")]
+    if let Commands::PatchGuestVsockListener { ref mount } = cli.command {
+        return setup::patch_guest_vsock_listener_files(mount);
+    }
+
     if let Commands::Completions { shell } = cli.command {
-        completions::emit_static(shell);
+        completions::emit(shell)?;
         return Ok(());
     }
     if matches!(cli.command, Commands::Init) {
@@ -1031,12 +1062,17 @@ pub fn run() -> Result<()> {
 
     let raw_args: Vec<String> = std::env::args().collect();
     match cli.command {
+        Commands::VsockProxy { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::ProbeFirecrackerSocket { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::DiskOp { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::PatchGuestNetwork { .. } => unreachable!("handled before config loading"),
+        #[cfg(target_os = "linux")]
+        Commands::PatchGuestVsockListener { .. } => {
+            unreachable!("handled before config loading")
+        }
         Commands::Up {
             dir,
             name,
@@ -1182,13 +1218,13 @@ pub fn run() -> Result<()> {
                 args.insert(0, "default".to_string());
                 args.insert(0, "--permission-mode".to_string());
             }
-            let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
+            let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::ClaudeAgents { name, mut args } => {
             let sess = open_agent_session(&be, &cfg, name.as_ref())?;
             args.insert(0, "agents".to_string());
-            let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
+            let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::Codex { name, ask, args } => {
@@ -1212,7 +1248,7 @@ pub fn run() -> Result<()> {
         Commands::Grok { name, ask, args } => {
             let sess = open_agent_session(&be, &cfg, name.as_ref())?;
             let args = grok_launch_args(ask, args);
-            let grok_bin = guest::GuestUser::new(sess.target.user.as_ref())?.grok_bin();
+            let grok_bin = guest::GuestUser::new(sess.target.user().as_ref())?.grok_bin();
             ssh::run_interactive(&sess, &prepend_binary(grok_bin.as_ref(), args))
         }
         Commands::Stop { name } => {
@@ -1435,10 +1471,69 @@ mod tests {
         Cli::parse_from(std::iter::once("coop").chain(args.iter().copied()))
     }
 
+    #[test]
+    fn parses_internal_vsock_proxy_command() {
+        let cli = parse(&[
+            "__vsock-proxy",
+            "--socket",
+            "/tmp/vsock.sock",
+            "--port",
+            "22",
+        ]);
+        let super::Commands::VsockProxy { socket, port } = cli.command else {
+            panic!("expected vsock proxy command");
+        };
+        assert_eq!(socket, std::path::PathBuf::from("/tmp/vsock.sock"));
+        assert_eq!(port.get(), 22);
+    }
+
     fn parse_err(args: &[&str]) -> clap::Error {
         match Cli::try_parse_from(std::iter::once("coop").chain(args.iter().copied())) {
             Err(e) => e,
             Ok(_) => panic!("expected parse failure"),
+        }
+    }
+
+    #[test]
+    fn codex_proxy_token_flag_requires_openai_and_excludes_api_key() {
+        let cli = parse(&[
+            "proxy",
+            "setup",
+            "--openai",
+            "--codex-access-token",
+            "--vm",
+            "my-vm",
+        ]);
+        let super::Commands::Proxy {
+            action:
+                super::ProxyAction::Setup {
+                    openai,
+                    codex_access_token,
+                    vm,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected proxy setup");
+        };
+        assert!(openai);
+        assert!(codex_access_token);
+        assert_eq!(vm.as_deref(), Some("my-vm"));
+        for args in [
+            &["proxy", "setup", "--codex-access-token"][..],
+            &["proxy", "setup", "--anthropic", "--codex-access-token"][..],
+            &[
+                "proxy",
+                "setup",
+                "--openai",
+                "--codex-access-token",
+                "--api-key",
+            ][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("coop").chain(args.iter().copied())).is_err(),
+                "expected parse failure for {args:?}"
+            );
         }
     }
 
@@ -2591,20 +2686,6 @@ token = "test-pat"
         ] {
             let kind = parse_err(args).kind();
             assert_eq!(kind, expected, "unexpected clap error for {args:?}");
-        }
-    }
-
-    #[test]
-    fn completions_emit_static_includes_subcommands() {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut cmd = <super::Cli as clap::CommandFactory>::command();
-        let name = cmd.get_name().to_string();
-        clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, name, &mut buf);
-        let Ok(script) = String::from_utf8(buf) else {
-            panic!("bash completion script is not valid utf-8");
-        };
-        for sub in ["shell", "claude", "destroy", "completions"] {
-            assert!(script.contains(sub), "completion script missing `{sub}`");
         }
     }
 }

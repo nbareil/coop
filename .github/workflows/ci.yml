@@ -33,8 +33,8 @@ jobs:
       # coop-proxy's aws-lc-sys crypto backend (issue #411) needs cmake; the
       # `--workspace` clippy/test below build it. The musl compile catches
       # target-specific libc API differences before the release workflow.
-      - name: Install cmake and musl tools
-        run: sudo apt-get update && sudo apt-get install -y cmake musl-tools
+      - name: Install cmake, musl tools, and zsh
+        run: sudo apt-get update && sudo apt-get install -y cmake musl-tools zsh
 
       - name: Check musl portability
         run: |
@@ -129,7 +129,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@422f3094be6a0843857aa008b499caaf6bce0da8 # v1.24.0
+        uses: cargo-bins/cargo-binstall@c06f6a0003f7c6165a00c89d1697731c9e8a5c72 # v1.25.2
 
       # Pin to match CARGO_DENY_VERSION in scripts/install-dev-tools.sh so CI and
       # local installs run the same version.

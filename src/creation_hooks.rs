@@ -280,7 +280,7 @@ pub(crate) fn run_pending(inst: &Instance, session: &SshSession) -> Result<Creat
         return Ok(CreationProgress::Unchanged);
     }
     ensure_prepared(&state)?;
-    let directory = crate::guest::GuestUser::new(session.target.user.as_ref())?.home();
+    let directory = crate::guest::GuestUser::new(session.target.user().as_ref())?.home();
     tracing::info!("Running global post_create");
     execute(session, &stage.command, directory.as_ref()).context("global post_create failed")?;
     stage.completion = Completion::Succeeded;
@@ -319,7 +319,7 @@ fn execute(session: &SshSession, command: &CreationCommand, directory: &str) -> 
                 .literal(" && cat > ")
                 .arg(&remote)
                 .literal("/hook.sh"),
-            script(command, directory).into_bytes(),
+            script(command, directory).as_bytes(),
         )?;
         execute_staged(session, &remote)
     })();
@@ -389,6 +389,7 @@ mod tests {
             name: InstanceName::new("hooks").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 
@@ -475,7 +476,7 @@ mod tests {
 
     #[test]
     fn selected_recipe_is_private_and_independent_of_later_config() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         let mut cfg = CoopConfig {
             post_create: Some("original secret".into()),
@@ -521,7 +522,7 @@ mod tests {
 
     #[test]
     fn failed_restore_preserves_completed_progress_on_original_disk() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let (inst, disk) = completed_restore_fixture(root.path());
         let original = fs::read(root.path().join("creation.json")).unwrap();
         let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
@@ -541,7 +542,7 @@ mod tests {
     #[test]
     fn destructive_restore_failures_keep_progress_pending() {
         for change in ["removed", "replaced", "symlink", "missing initially"] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::private_tempdir().unwrap();
             let (inst, disk) = completed_restore_fixture(root.path());
             if change == "missing initially" {
                 fs::remove_file(&disk).unwrap();
@@ -568,7 +569,7 @@ mod tests {
 
     #[test]
     fn successful_restore_keeps_progress_pending() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let (inst, disk) = completed_restore_fixture(root.path());
         crate::creation_hooks::restore_disk(&inst, &disk, || {
             fs::remove_file(&disk)?;
@@ -583,7 +584,7 @@ mod tests {
     #[test]
     fn unsafe_disk_or_corrupt_progress_prevents_restore() {
         for failure in ["symlink", "hardlink", "corrupt recipe"] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::private_tempdir().unwrap();
             let (inst, disk) = completed_restore_fixture(root.path());
             let recipe = root.path().join("creation.json");
             let before = fs::read(&recipe).unwrap();
@@ -616,7 +617,7 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let (inst, disk) = completed_restore_fixture(root.path());
         let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
             fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000))?;
@@ -664,7 +665,7 @@ mod tests {
             assert!(!pending(&inst).unwrap());
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -683,7 +684,7 @@ mod tests {
 
     #[test]
     fn rollback_failure_reports_both_errors() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let (inst, disk) = completed_restore_fixture(root.path());
         let recipe = root.path().join("creation.json");
         let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
@@ -704,7 +705,7 @@ mod tests {
 
     #[test]
     fn legacy_restore_has_no_creation_progress_side_effects() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         let called = std::cell::Cell::new(false);
         let error =
@@ -720,7 +721,7 @@ mod tests {
 
     #[test]
     fn completed_hook_is_skipped_and_restore_resets_progress() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         let cfg = CoopConfig {
             post_create: Some("global".into()),
@@ -752,7 +753,7 @@ mod tests {
 
     #[test]
     fn legacy_and_empty_recipes_are_ready_but_corruption_fails_closed() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         assert!(ensure_complete(&inst).is_ok());
         restore_disk(&inst, &root.path().join("missing-disk"), || Ok(())).unwrap();
@@ -772,7 +773,7 @@ mod tests {
 
     #[test]
     fn unreadable_recipe_is_not_treated_as_a_legacy_instance() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         fs::create_dir(root.path().join("creation.json")).unwrap();
         assert!(CreationState::load(&inst).is_err());
@@ -782,7 +783,7 @@ mod tests {
 
     #[test]
     fn recipe_reads_and_replacements_tighten_private_storage() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(&root.path().join("instance"));
         let cfg = CoopConfig {
             post_create: Some("saved command".into()),
@@ -813,7 +814,7 @@ mod tests {
 
     #[test]
     fn recipe_links_cannot_bypass_completion_or_overwrite_other_files() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(&root.path().join("instance"));
         let state = CreationState::select(&CoopConfig::default(), None).unwrap();
         state.save(&inst).unwrap();
@@ -842,7 +843,7 @@ mod tests {
 
     #[test]
     fn recipes_reject_symlinked_and_writable_ancestors() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let parent = root.path().join("shared");
         let inst = instance(&parent.join("instance"));
         let state = CreationState::select(&CoopConfig::default(), None).unwrap();
@@ -863,7 +864,7 @@ mod tests {
 
     #[test]
     fn missing_instance_recipe_does_not_create_storage() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(&root.path().join("missing/instance"));
         assert!(CreationState::load(&inst).unwrap().is_none());
         assert!(!root.path().join("missing").exists());
@@ -881,32 +882,41 @@ mod tests {
         env.set("SECRET", "creation-guest-only").unwrap();
         env.set("COOP_SSH_ENV_0", "creation-alias").unwrap();
         let session = crate::backend::SshSession {
-            target: crate::backend::SshTarget {
-                host: crate::backend::Hostname::new("127.0.0.1").unwrap(),
-                port: std::num::NonZeroU16::MIN,
-                user: crate::backend::SshUser::new("ubuntu").unwrap(),
-                key_path: root.join("unused-key"),
-            },
+            target: crate::backend::SshTarget::tcp(
+                crate::backend::Hostname::new("127.0.0.1").unwrap(),
+                std::num::NonZeroU16::MIN,
+                crate::backend::SshUser::new("ubuntu").unwrap(),
+                root.join("unused-key"),
+                crate::config::SshHostToolsConfig::with_exact_paths(
+                    Some(&root.join("host-bin/ssh")),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ),
             env,
         };
         execute_staged(&session, root.to_str().unwrap()).unwrap();
     }
 
     fn prepare_creation_transport_fixture(root: &Path) {
-        fs::create_dir(root.join("host-bin")).unwrap();
-        fs::create_dir(root.join("guest-bin")).unwrap();
+        crate::test_support::create_private_dir_all(root.join("host-bin")).unwrap();
+        crate::test_support::create_private_dir_all(root.join("guest-bin")).unwrap();
         let ssh = root.join("host-bin/ssh");
         fs::write(
             &ssh,
-            r#"#!/bin/sh
+            format!(
+                r#"#!/bin/sh
 set -eu
-test "$PATH" = "$COOP_CREATION_FIXTURE/host-bin"
-test "${LD_LIBRARY_PATH-unset}" = unset
-test "${SECRET-unset}" = unset
-printf host > "$COOP_CREATION_FIXTURE/host-launched"
+test "${{LD_LIBRARY_PATH-unset}}" = unset
+test "${{SECRET-unset}}" = unset
+test "${{COOP_CREATION_FIXTURE-unset}}" = unset
+printf host > {0}/host-launched
 for arg do remote=$arg; done
 SHELL=/bin/bash /bin/sh -c "$remote"
 "#,
+                crate::shell::shell_escape(&root.to_string_lossy())
+            ),
         )
         .unwrap();
         fs::set_permissions(ssh, fs::Permissions::from_mode(0o700)).unwrap();
@@ -919,14 +929,18 @@ SHELL=/bin/bash /bin/sh -c "$remote"
         fs::set_permissions(injected, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(
             root.join("hook.sh"),
-            r#"#!/bin/bash
+            format!(
+                r#"#!/bin/bash
 set -euo pipefail
-test "$PATH" = "$COOP_CREATION_FIXTURE/guest-bin:/usr/bin:/bin"
+test "$PATH" = {1}
 test "$LD_LIBRARY_PATH" = /creation-guest-libraries
 test "$SECRET" = creation-guest-only
 test "$COOP_SSH_ENV_0" = creation-alias
-printf guest > "$COOP_CREATION_FIXTURE/guest-restored"
+printf guest > {0}/guest-restored
 "#,
+                crate::shell::shell_escape(&root.to_string_lossy()),
+                crate::shell::shell_escape(&format!("{}/guest-bin:/usr/bin:/bin", root.display())),
+            ),
         )
         .unwrap();
     }
@@ -937,7 +951,7 @@ printf guest > "$COOP_CREATION_FIXTURE/guest-restored"
             run_creation_transport_fixture(Path::new(&root));
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::host_tool::trusted_test_tempdir();
         prepare_creation_transport_fixture(root.path());
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -969,7 +983,7 @@ printf guest > "$COOP_CREATION_FIXTURE/guest-restored"
 
     #[test]
     fn global_shell_command_preserves_quoting_and_selected_directory() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let command =
             CreationCommand::shell(r#"printf '%s' "literal \$(touch injected); ' space" > result"#)
                 .unwrap();
@@ -990,7 +1004,7 @@ printf guest > "$COOP_CREATION_FIXTURE/guest-restored"
 
     #[test]
     fn removed_project_and_argv_recipes_fail_closed() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         let cfg = CoopConfig {
             post_create: Some("true".into()),
@@ -1013,7 +1027,7 @@ printf guest > "$COOP_CREATION_FIXTURE/guest-restored"
 
     #[test]
     fn missing_hook_directory_fails_without_entering_supervisor() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let path = root.path().join("hook.sh");
         let command = CreationCommand::shell("touch executed").unwrap();
         fs::write(
